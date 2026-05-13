@@ -1,0 +1,5 @@
+{
+  "user.mapping": [
+    "aem-infralytiqs-integrator.core:user-enrichment=infralytiqs-user-enrichment"
+  ]
+}

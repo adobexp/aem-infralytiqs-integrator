@@ -1,0 +1,10 @@
+{
+  "tenantId": "REPLACE_WITH_IL_MODULE_CONFIGURATION_TENANT_ID",
+  "siteId": "REPLACE_WITH_IL_MODULE_CONFIGURATION_SITE_ID",
+  "baseUri": "http://localhost:8080",
+  "batchMaxEvents": 100,
+  "flushIntervalMs": 2500,
+  "queueCapacity": 50000,
+  "httpTimeoutSeconds": 30,
+  "maxConcurrentPosts": 2
+}

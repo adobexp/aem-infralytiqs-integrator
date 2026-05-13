@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.adobexp.Infralytiqs</groupId>
+        <artifactId>aem-infralytiqs-integrator</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>aem-infralytiqs-integrator.all</artifactId>
+    <packaging>content-package</packaging>
+    <name>AEM Infralytiqs Integrator - All</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>aem-infralytiqs-integrator.core</artifactId>
+            <type>jar</type>
+        </dependency>
+        <dependency>
+            <groupId>com.adobexp.loki</groupId>
+            <artifactId>aem-loki-integrator.core</artifactId>
+            <type>jar</type>
+            <version>${loki.integrator.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.jackrabbit</groupId>
+                <artifactId>filevault-package-maven-plugin</artifactId>
+                <extensions>true</extensions>
+                <configuration>
+                    <group>com.adobexp.Infralytiqs</group>
+                    <name>aem-infralytiqs-integrator.all</name>
+                    <packageType>mixed</packageType>
+                    <allowIndexDefinitions>true</allowIndexDefinitions>
+                    <filterSource>src/main/content/META-INF/vault/filter.xml</filterSource>
+                    <validatorsSettings>
+                        <jackrabbit-nodetypes>
+                            <options>
+                                <cnds>tccl:aem.cnd</cnds>
+                            </options>
+                        </jackrabbit-nodetypes>
+                        <jackrabbit-packagetype>
+                            <isDisabled>true</isDisabled>
+                        </jackrabbit-packagetype>
+                    </validatorsSettings>
+                    <embeddeds>
+                        <embedded>
+                            <groupId>${project.groupId}</groupId>
+                            <artifactId>aem-infralytiqs-integrator.core</artifactId>
+                            <type>jar</type>
+                            <target>/apps/aem-infralytiqs-integrator-packages/application/install</target>
+                        </embedded>
+                        <embedded>
+                            <groupId>com.adobexp.loki</groupId>
+                            <artifactId>aem-loki-integrator.core</artifactId>
+                            <type>jar</type>
+                            <target>/apps/aem-infralytiqs-integrator-packages/application/install</target>
+                        </embedded>
+                    </embeddeds>
+                </configuration>
+                <dependencies>
+                    <dependency>
+                        <groupId>biz.netcentric.aem</groupId>
+                        <artifactId>aem-nodetypes</artifactId>
+                        <version>6.5.7.0</version>
+                    </dependency>
+                </dependencies>
+            </plugin>
+        </plugins>
+    </build>
+</project>

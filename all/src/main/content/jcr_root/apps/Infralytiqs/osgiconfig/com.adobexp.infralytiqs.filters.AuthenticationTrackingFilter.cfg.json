@@ -1,0 +1,8 @@
+{
+  "marker": "infralytiqs-authentication-tracking-enabled",
+  "patterns": [
+    "name=pattern_1_saml_login;subtype=post_saml_response_redirect_status_302;url_suffix=/saml_login;method=POST;status=redirect;response_cookie=login-token;body_contains=SAMLResponse=;priority=1",
+    "name=pattern_2_oidc_fragment;subtype=get_oauth_exchange_redirect_status_302;url_suffix=/j_security_check;method=GET;status=redirect;response_cookie=login-token;query_params=code;priority=2",
+    "name=pattern_3_basic_form;subtype=post_basic_credentials_status_200;url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token;form_params=j_username,j_password;priority=3"
+  ]
+}
