@@ -8,7 +8,7 @@
         <version>1.0.1</version>
     </parent>
 
-    <groupId>com.adobexp.Infralytiqs</groupId>
+    <groupId>com.adobexp.infralytiqs</groupId>
     <artifactId>aem-infralytiqs-integrator</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
@@ -51,6 +51,13 @@
         <maven-release-plugin>3.0.1</maven-release-plugin>
         <maven-scm-plugin>2.0.1</maven-scm-plugin>
     </properties>
+
+    <scm>
+        <url>https://github.com/adobexp/aem-infralytiqs-integrator</url>
+        <connection>scm:git:git@github.com:adobexp/aem-infralytiqs-integrator.git</connection>
+        <developerConnection>scm:git:git@github.com:adobexp/aem-infralytiqs-integrator.git</developerConnection>
+        <tag>HEAD</tag>
+    </scm>
 
     <build>
         <pluginManagement>
