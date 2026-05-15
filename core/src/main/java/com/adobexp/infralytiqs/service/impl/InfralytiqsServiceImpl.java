@@ -9,8 +9,6 @@ import com.adobexp.infralytiqs.service.TenantService;
 import com.adobexp.infralytiqs.service.TenantServiceManager;
 import com.adobexp.log.Logger;
 import com.adobexp.log.LoggerFactory;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.net.URI;
@@ -35,19 +33,11 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
-import javax.jcr.Node;
-import javax.jcr.NodeIterator;
 import javax.jcr.Session;
 import javax.jcr.Value;
-import javax.jcr.security.AccessControlEntry;
-import javax.jcr.security.AccessControlManager;
-import javax.jcr.security.AccessControlPolicy;
-import javax.jcr.security.Privilege;
 import javax.net.ssl.SSLContext;
 
 import org.apache.jackrabbit.api.JackrabbitSession;
-import org.apache.jackrabbit.api.security.JackrabbitAccessControlEntry;
-import org.apache.jackrabbit.api.security.JackrabbitAccessControlList;
 import org.apache.jackrabbit.api.security.user.Authorizable;
 import org.apache.jackrabbit.api.security.user.Group;
 import org.apache.jackrabbit.api.security.user.User;
@@ -79,8 +69,11 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
 
     private static final Logger LOG = LoggerFactory.getLogger(InfralytiqsServiceImpl.class);
 
-    /** Shared, thread-safe by design when only used for read operations (readTree). */
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * Custom dimension key emitted during user enrichment — JSON array of Jackrabbit principal names
+     * for each {@link Group} this user declares membership in (same iterator as ACL tooling used historically).
+     */
+    private static final String DIM_USER_GROUPS = "user_groups";
 
     @ObjectClassDefinition(
             name = "Infralytiqs — analytics ingest configuration",
@@ -131,39 +124,6 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                 name = "User profile cache max entries",
                 description = "Hard cap on the in-memory user-profile cache; oldest entries are evicted when exceeded.")
         int userCacheMaxEntries() default 5000;
-
-        @AttributeDefinition(
-                name = "Scan accessible DAM folders during enrichment",
-                description = "When true, after resolving the user profile the worker thread also walks the direct children of "
-                        + "'damVisibilityScanRoot' and computes which folders the user (or their groups) is allowed to read. "
-                        + "The result is cached alongside the profile and emitted as 'accessible_dam_folders'.")
-        boolean damVisibilityScanEnabled() default true;
-
-        @AttributeDefinition(
-                name = "DAM visibility scan root",
-                description = "JCR path whose direct children are inspected for read access. Default '/content/dam'.")
-        String damVisibilityScanRoot() default "/content/dam";
-
-        @AttributeDefinition(
-                name = "DAM visibility scan max folders",
-                description = "Sanity cap on the number of accessible folders reported per user. Above this we stop scanning.")
-        int damVisibilityScanMaxFolders() default 100;
-
-        @AttributeDefinition(
-                name = "Visibility probe paths (tagged)",
-                description = "Tagged JCR-path probes evaluated once per uncached user, off the request thread. "
-                        + "Each entry is a JSON object with three required fields: "
-                        + "'eventName' (custom-dimension key the report engine filters on, e.g. 'DAM'), "
-                        + "'eventValue' (token added to that dimension when the user can read 'path', e.g. 'ARC-DAM'), "
-                        + "and 'path' (absolute JCR path to test). On a match, the resolved profile gets "
-                        + "custom_dimensions[eventName] = JSON array of all matched eventValues for that name "
-                        + "(insertion-ordered, deduped) — so multiple entries can share the same eventName to "
-                        + "produce multi-value tags. Example entry (one String[] element): "
-                        + "{\"eventName\":\"DAM\",\"eventValue\":\"ARC-DAM\",\"path\":\"/content/dam/px/arc\"}. "
-                        + "Performance: O(N) extra ACL lookups per uncached user where N is the list size — keep it small (≤ 20). "
-                        + "Unparseable / incomplete entries are skipped with a WARN log. Empty by default.",
-                cardinality = Integer.MAX_VALUE)
-        String[] visibilityProbePaths() default {};
     }
 
     private volatile InfralytiqsServiceCfg cfg;
@@ -183,7 +143,7 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
 
     /** Sentinel used in the cache to remember "lookup failed" without re-hitting JCR every batch. */
     private static final UserProfile UNKNOWN =
-            new UserProfile("", "", "", Collections.emptyList(), Collections.emptyMap());
+            new UserProfile("", "", "", Collections.emptyList());
 
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
     private volatile ResourceResolverFactory resourceResolverFactory;
@@ -201,43 +161,19 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         final String userId;
         final String email;
         final String displayName;
-        /** DAM folders this user can read; populated only when damVisibilityScanEnabled is true. */
-        final List<String> accessibleDamFolders;
         /**
-         * Tag-style visibility results derived from {@code visibilityProbePaths}: keyed by the probe's
-         * eventName, value is the insertion-ordered, deduped list of matched eventValues for that name.
-         * Empty when no probes are configured / no probes matched.
+         * Jackrabbit/Oak group principal identifiers from {@link User#memberOf()} (deduped, sorted lexicographically
+         * for stable JSON payloads). Empty when unresolved or membership cannot be enumerated.
          */
-        final Map<String, List<String>> visibilityTags;
+        final List<String> memberGroupPrincipalIds;
 
-        UserProfile(
-                String userId,
-                String email,
-                String displayName,
-                List<String> accessibleDamFolders,
-                Map<String, List<String>> visibilityTags) {
+        UserProfile(String userId, String email, String displayName, List<String> memberGroupPrincipalIds) {
             this.userId = userId == null ? "" : userId;
             this.email = email == null ? "" : email;
             this.displayName = displayName == null ? "" : displayName;
-            this.accessibleDamFolders = accessibleDamFolders == null
+            this.memberGroupPrincipalIds = memberGroupPrincipalIds == null
                     ? Collections.emptyList()
-                    : accessibleDamFolders;
-            this.visibilityTags = visibilityTags == null
-                    ? Collections.emptyMap()
-                    : visibilityTags;
-        }
-    }
-
-    /** Parsed form of one entry of {@code visibilityProbePaths}; immutable, validated up-front. */
-    private static final class ProbeEntry {
-        final String eventName;
-        final String eventValue;
-        final String path;
-
-        ProbeEntry(String eventName, String eventValue, String path) {
-            this.eventName = eventName;
-            this.eventValue = eventValue;
-            this.path = path;
+                    : memberGroupPrincipalIds;
         }
     }
 
@@ -577,22 +513,9 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
 
             Map<String, String> extraDims = null;
             Map<String, Double> extraMetrics = null;
-            boolean hasFolders = !prof.accessibleDamFolders.isEmpty();
-            boolean hasTags = !prof.visibilityTags.isEmpty();
-            if (hasFolders || hasTags) {
-                extraDims = new LinkedHashMap<>(2 + prof.visibilityTags.size());
-                extraMetrics = new LinkedHashMap<>(1);
-                if (hasFolders) {
-                    extraDims.put("accessible_dam_folders", toJsonStringArray(prof.accessibleDamFolders));
-                    extraMetrics.put("accessible_dam_folder_count", (double) prof.accessibleDamFolders.size());
-                }
-                // Tagged probes (visibilityProbePaths): one custom_dimension per distinct eventName,
-                // value is a JSON array of all matched eventValues — supports the report DSL's
-                // 'contains' op so panels filter on a stable token (e.g. "ARC-DAM") rather than on
-                // a brittle JCR path.
-                for (Map.Entry<String, List<String>> e : prof.visibilityTags.entrySet()) {
-                    extraDims.put(e.getKey(), toJsonStringArray(e.getValue()));
-                }
+            if (!prof.userId.isEmpty()) {
+                extraDims = new LinkedHashMap<>(1);
+                extraDims.put(DIM_USER_GROUPS, toJsonStringArray(prof.memberGroupPrincipalIds));
             }
 
             out.add(p.withUser(resolvedUserId, prof.email, prof.displayName, extraDims, extraMetrics));
@@ -640,10 +563,9 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                 return result;
             }
 
-            Session session = rr.adaptTo(Session.class);
             long ttlNanos = TimeUnit.SECONDS.toNanos(Math.max(1, live.userCacheTtlSeconds()));
             for (String hint : needsLookup) {
-                UserProfile prof = lookupProfile(userManager, session, hint, live);
+                UserProfile prof = lookupProfile(userManager, hint);
                 profileCache.put(hint, new CachedProfile(prof, System.nanoTime() + ttlNanos));
                 result.put(hint, prof);
             }
@@ -688,8 +610,7 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         return null;
     }
 
-    private static UserProfile lookupProfile(UserManager userManager, Session session, String hint,
-            InfralytiqsServiceCfg cfg) {
+    private static UserProfile lookupProfile(UserManager userManager, String hint) {
         try {
             Authorizable authorizable = userManager.getAuthorizable(hint);
             if (!(authorizable instanceof User)) {
@@ -707,256 +628,68 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                 displayName = displayName.isEmpty() ? familyName : (displayName + " " + familyName);
             }
 
-            List<String> accessibleDamFolders = Collections.emptyList();
-            Map<String, List<String>> visibilityTags = Collections.emptyMap();
-            if (cfg.damVisibilityScanEnabled() && session != null) {
-                Set<String> principalNames = collectPrincipalNames(user);
-                AccessControlManager acm = session.getAccessControlManager();
-                int max = Math.max(1, cfg.damVisibilityScanMaxFolders());
-                accessibleDamFolders = scanAccessibleDamFolders(session, acm, principalNames, cfg, max);
-                visibilityTags = evaluateVisibilityProbes(session, acm, principalNames, cfg.visibilityProbePaths());
-            }
+            List<String> memberGroups = collectMemberGroupPrincipalIds(user);
 
-            return new UserProfile(userId, email, displayName, accessibleDamFolders, visibilityTags);
+            return new UserProfile(userId, email, displayName, memberGroups);
         } catch (Exception ex) {
             return UNKNOWN;
         }
     }
 
     /**
-     * Heuristic ACL-based scan to determine which direct children of {@code damVisibilityScanRoot}
-     * the supplied user is allowed to read. Inspects effective policies on each candidate node and
-     * matches access-control entries against the user's principal set (the user themselves +
-     * transitive group memberships + the implicit 'everyone' principal). All work runs on the
-     * service worker thread; never on a request thread.
+     * Jackrabbit/Oak group identifiers for this user (union of {@link User#declaredMemberOf()} and
+     * {@link User#memberOf()}). Uses each group's {@link Authorizable#getID()} so values match authorizable
+     * IDs in the security UI (e.g. {@code PG-AUTHOR-BASE}), with fallback to the Java {@code Principal} name.
+     * Sorted for stable payloads; deduped.
      *
-     * <p>Note: deeper paths (anything more than one level below the scan root) are <em>not</em>
-     * enumerated here — use {@code visibilityProbePaths} for targeted deeper probes that emit
-     * tag-style custom dimensions instead.</p>
+     * <p><b>Repository access:</b> the enrichment service user must have {@code jcr:read} on {@code /home/groups}
+     * so Oak can resolve group authorizables during iteration. Without it, only implicit principals such as
+     * {@code everyone} are typically visible.</p>
      */
-    private static List<String> scanAccessibleDamFolders(
-            Session session,
-            AccessControlManager acm,
-            Set<String> principalNames,
-            InfralytiqsServiceCfg cfg,
-            int max) {
+    private static List<String> collectMemberGroupPrincipalIds(User user) {
+        Set<String> names = new LinkedHashSet<>();
         try {
-            String root = cfg.damVisibilityScanRoot();
-            if (root == null || root.isEmpty() || !session.nodeExists(root)) {
-                return Collections.emptyList();
-            }
-            Node parent = session.getNode(root);
-            Set<String> visible = new LinkedHashSet<>();
-            NodeIterator it = parent.getNodes();
-            while (it.hasNext() && visible.size() < max) {
-                Node child = it.nextNode();
-                String childName = child.getName();
-                if (childName.startsWith("rep:") || childName.startsWith("jcr:")) {
-                    continue;
-                }
-                if (canRead(acm, child.getPath(), principalNames)) {
-                    visible.add(child.getPath());
-                }
-            }
-            return Collections.unmodifiableList(new ArrayList<>(visible));
-        } catch (Exception ex) {
-            LOG.debug("[{}] dam visibility scan failed: {}", PID, ex.toString());
-            return Collections.emptyList();
-        }
-    }
-
-    /**
-     * Run each configured {@code visibilityProbePaths} entry as a single read-access ACL check.
-     * Matches are grouped by {@code eventName} and produce, per name, an insertion-ordered &amp;
-     * deduped list of {@code eventValue} tokens. Entries are typically declared most-specific
-     * first (e.g. {@code /content/dam/px/arc} → {@code ARC-DAM} before {@code /content/dam} →
-     * {@code GLOBAL-DAM}), and a user with access to multiple of them gets multi-value coverage
-     * — report panels then filter on the dimension with the {@code contains} operator.
-     *
-     * <p>Each evaluation is exactly one effective-ACE lookup; cost is O(N) per uncached user
-     * where N is the configured probe count. Unknown paths (e.g. an Author-only path on Publish)
-     * are skipped silently. Returns an empty map when the config is empty / nothing matched.</p>
-     */
-    private static Map<String, List<String>> evaluateVisibilityProbes(
-            Session session, AccessControlManager acm, Set<String> principalNames, String[] rawProbes) {
-        List<ProbeEntry> probes = parseProbeEntries(rawProbes);
-        if (probes.isEmpty()) {
-            return Collections.emptyMap();
-        }
-        Map<String, LinkedHashSet<String>> grouped = new LinkedHashMap<>();
-        for (ProbeEntry probe : probes) {
-            try {
-                if (!session.nodeExists(probe.path)) {
-                    // Common case for shared cfg between Author + Publish — only one instance
-                    // hosts a given subtree.
-                    continue;
-                }
-                if (canRead(acm, probe.path, principalNames)) {
-                    grouped.computeIfAbsent(probe.eventName, k -> new LinkedHashSet<>()).add(probe.eventValue);
-                }
-            } catch (Exception ex) {
-                LOG.debug("[{}] visibility probe failed for path={}: {}", PID, probe.path, ex.toString());
-            }
-        }
-        if (grouped.isEmpty()) {
-            return Collections.emptyMap();
-        }
-        Map<String, List<String>> out = new LinkedHashMap<>(grouped.size());
-        for (Map.Entry<String, LinkedHashSet<String>> e : grouped.entrySet()) {
-            out.put(e.getKey(), Collections.unmodifiableList(new ArrayList<>(e.getValue())));
-        }
-        return Collections.unmodifiableMap(out);
-    }
-
-    /**
-     * Parse {@code visibilityProbePaths} entries. Each raw String is a JSON object literal of
-     * shape {@code {"eventName":"...","eventValue":"...","path":"/abs/jcr/path"}}; missing or
-     * blank fields, non-absolute paths, and unparseable JSON are skipped with a WARN log so a
-     * single bad config line cannot poison the rest of the list.
-     */
-    private static List<ProbeEntry> parseProbeEntries(String[] raw) {
-        if (raw == null || raw.length == 0) {
-            return Collections.emptyList();
-        }
-        List<ProbeEntry> out = new ArrayList<>(raw.length);
-        for (String entry : raw) {
-            if (entry == null) {
-                continue;
-            }
-            String s = entry.trim();
-            if (s.isEmpty()) {
-                continue;
-            }
-            try {
-                JsonNode n = MAPPER.readTree(s);
-                if (n == null || !n.isObject()) {
-                    LOG.warn(
-                            "[{}] visibilityProbePaths: skipping non-object entry: {}",
-                            PID,
-                            s);
-                    continue;
-                }
-                String name = n.path("eventName").asText("").trim();
-                String value = n.path("eventValue").asText("").trim();
-                String path = n.path("path").asText("").trim();
-                if (name.isEmpty() || value.isEmpty() || path.isEmpty() || !path.startsWith("/")) {
-                    LOG.warn(
-                            "[{}] visibilityProbePaths: skipping entry with missing/invalid eventName, eventValue, or path: {}",
-                            PID,
-                            s);
-                    continue;
-                }
-                out.add(new ProbeEntry(name, value, path));
-            } catch (Exception ex) {
-                LOG.warn(
-                        "[{}] visibilityProbePaths: skipping unparseable entry ({}): {}",
-                        PID,
-                        ex.toString(),
-                        s);
-            }
-        }
-        return out;
-    }
-
-    private static Set<String> collectPrincipalNames(User user) {
-        Set<String> names = new java.util.LinkedHashSet<>();
-        try {
-            names.add(user.getPrincipal().getName());
+            addGroupIdsFromIterator(user.declaredMemberOf(), names);
         } catch (Exception ignored) {
             // best effort
         }
-        // Implicit principal everyone — granted to all authenticated users by AEM default policies.
-        names.add("everyone");
         try {
-            Iterator<Group> groups = user.memberOf();
-            while (groups.hasNext()) {
-                try {
-                    names.add(groups.next().getPrincipal().getName());
-                } catch (Exception ignored) {
-                    // skip malformed group
-                }
-            }
+            addGroupIdsFromIterator(user.memberOf(), names);
         } catch (Exception ignored) {
             // best effort
         }
-        return names;
+        List<String> sorted = new ArrayList<>(names);
+        Collections.sort(sorted);
+        return Collections.unmodifiableList(sorted);
     }
 
-    /**
-     * Inspect the effective ACL policies on {@code path} and decide whether the supplied principal
-     * set has a read privilege. Deny entries take precedence over allow entries (standard JCR
-     * resolution semantics). Falls back to "yes" only when the {@code everyone} principal is in
-     * the set and no explicit ACE applies — matching AEM's default of read-for-all on /content/dam.
-     */
-    private static boolean canRead(AccessControlManager acm, String path, Set<String> principalNames) {
-        try {
-            AccessControlPolicy[] policies = acm.getEffectivePolicies(path);
-            boolean allow = false;
-            boolean deny = false;
-            boolean matchedAny = false;
-            for (AccessControlPolicy p : policies) {
-                if (!(p instanceof JackrabbitAccessControlList)) {
+    private static void addGroupIdsFromIterator(Iterator<Group> groups, Set<String> into) {
+        if (groups == null) {
+            return;
+        }
+        while (groups.hasNext()) {
+            Group g = groups.next();
+            if (g == null) {
+                continue;
+            }
+            try {
+                String id = g.getID();
+                if (id != null && !id.trim().isEmpty()) {
+                    into.add(id.trim());
                     continue;
                 }
-                for (AccessControlEntry ace : ((JackrabbitAccessControlList) p).getAccessControlEntries()) {
-                    String principalName = ace.getPrincipal() == null ? null : ace.getPrincipal().getName();
-                    if (principalName == null || !principalNames.contains(principalName)) {
-                        continue;
-                    }
-                    if (!hasReadPrivilege(ace.getPrivileges())) {
-                        continue;
-                    }
-                    matchedAny = true;
-                    boolean isAllow = !(ace instanceof JackrabbitAccessControlEntry)
-                            || ((JackrabbitAccessControlEntry) ace).isAllow();
-                    if (isAllow) {
-                        allow = true;
-                    } else {
-                        deny = true;
-                    }
+            } catch (Exception ignored) {
+                // fall through to principal name
+            }
+            try {
+                String pn = g.getPrincipal() == null ? null : g.getPrincipal().getName();
+                if (pn != null && !pn.trim().isEmpty()) {
+                    into.add(pn.trim());
                 }
-            }
-            if (deny) {
-                return false;
-            }
-            if (allow) {
-                return true;
-            }
-            // No matching ACE — defer to AEM default. /content/dam is granted to 'everyone' OOTB.
-            return !matchedAny && principalNames.contains("everyone");
-        } catch (Exception ex) {
-            return false;
-        }
-    }
-
-    private static boolean hasReadPrivilege(Privilege[] privs) {
-        if (privs == null) {
-            return false;
-        }
-        for (Privilege p : privs) {
-            if (privilegeImpliesRead(p)) {
-                return true;
+            } catch (Exception ignored) {
+                // skip malformed group
             }
         }
-        return false;
-    }
-
-    private static boolean privilegeImpliesRead(Privilege priv) {
-        if (priv == null) {
-            return false;
-        }
-        String n = priv.getName();
-        if ("jcr:read".equals(n) || "jcr:all".equals(n) || "rep:readNodes".equals(n)) {
-            return true;
-        }
-        if (priv.isAggregate()) {
-            for (Privilege agg : priv.getAggregatePrivileges()) {
-                if (privilegeImpliesRead(agg)) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private static String toJsonStringArray(List<String> values) {

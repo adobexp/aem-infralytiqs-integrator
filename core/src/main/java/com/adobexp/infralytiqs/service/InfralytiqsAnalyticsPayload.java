@@ -112,9 +112,8 @@ public final class InfralytiqsAnalyticsPayload {
 
     /**
      * Same as {@link #withUser(String, String, String)} but also overlays additional dimensions
-     * and metrics on top of the existing ones. Used by the service to attach data computed during
-     * profile enrichment (e.g. accessible DAM folders) without forcing every caller to know about
-     * those keys.
+     * and metrics on top of the existing ones. Used by the service to attach profile enrichment
+     * (e.g. {@code user_groups} listing group principal identifiers) without forcing callers to own those keys.
      */
     public InfralytiqsAnalyticsPayload withUser(String userId, String userEmail, String displayName,
             Map<String, String> extraDimensions, Map<String, Double> extraMetrics) {

@@ -1,6 +1,6 @@
 {
   "scripts": [
     "create service user infralytiqs-user-enrichment with path system/cq:services/infralytiqs",
-    "set ACL for infralytiqs-user-enrichment\n    allow jcr:read on /home/users\n    allow jcr:read on /content/dam\n    allow jcr:readAccessControl on /content/dam\nend"
+    "set ACL for infralytiqs-user-enrichment\n    allow jcr:read on /home/users\n    allow jcr:read on /home/groups\n    allow jcr:read on /content/dam\n    allow jcr:readAccessControl on /content/dam\nend"
   ]
 }
