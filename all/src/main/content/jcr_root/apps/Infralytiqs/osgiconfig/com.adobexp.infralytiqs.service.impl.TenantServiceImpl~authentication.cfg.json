@@ -1,7 +1,0 @@
-{
-  "rootPath": "/",
-  "tenantId": "groupe-dam",
-  "siteId": "DEV",
-  "dbName": "PublicisDB",
-  "analyticsServerUrl": "http://localhost:8080"
-}
