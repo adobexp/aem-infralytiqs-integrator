@@ -2,8 +2,9 @@
   "marker": "infralytiqs-download-tracking-enabled",
   "responseBufferMaxBytes": 262144,
   "patterns": [
-    "name=pattern_1_downloadbinaries;subtype=post_downloadbinaries_status_201;url_suffix=.downloadbinaries.json;method=POST;status=201;response_is_json=true;json_required_props=downloadId;extract_path_from_url=true;json_string_props=downloadId:download_id;priority=1",
+    "name=pattern_1_downloadbinaries_init;subtype=post_downloadbinaries_init_status_201;url_suffix=.downloadbinaries.json;method=POST;status=201;response_is_json=true;json_required_props=downloadId;extract_path_from_url=true;json_string_props=downloadId:download_id;priority=1",
     "name=pattern_2_renditions_zip;subtype=post_download_asset_renditions_zip_status_200;url_suffix=download-asset-renditions.zip;method=POST;status=200;response_is_json=true;json_required_props=id,assets,archiveName;json_string_props=id:download_id,archiveName:download_archive_name;json_array_props=assets:download_paths;priority=2",
-    "name=pattern_3_download_bin;subtype=get_download_bin_status_200;url_suffix=.download.bin;method=GET;status=200;extract_path_from_url=true;priority=3"
+    "name=pattern_3_download_bin;subtype=get_download_bin_status_200;url_suffix=.download.bin;method=GET;status=200;extract_path_from_url=true;priority=3",
+    "name=pattern_4_downloadbinaries_fetch;subtype=get_downloadbinaries_fetch_status_200;url_suffix=.downloadbinaries.json;method=GET;status=200;query_params_required=downloadId,artifactId;query_param_dimensions=downloadId:download_id,artifactId:download_artifact_id;priority=4"
   ]
 }

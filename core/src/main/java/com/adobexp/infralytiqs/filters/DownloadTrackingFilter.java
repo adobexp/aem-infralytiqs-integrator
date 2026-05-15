@@ -54,6 +54,24 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * response (default 256 KB), and (c) a single non-blocking enqueue. No JCR work, no synchronous
  * outbound calls — the service handles batching, user-profile enrichment and HTTP shipping on its
  * own worker pool.
+ *
+ * <h2>Registration: OSGi HTTP Whiteboard, not Sling filter</h2>
+ *
+ * <p>On AEMaaCS the asset download endpoints — {@code *.downloadbinaries.json} on author and
+ * {@code *.download-asset-renditions.zip} on publish — are served by handlers that do not
+ * reliably traverse the Sling main-servlet filter chain (the same reason
+ * {@link AuthenticationTrackingFilter} cannot rely on {@code sling.filter.scope=REQUEST} for
+ * {@code /j_security_check} — Adobe's auth/asset handlers can short-circuit the response back to
+ * the Felix HTTP layer before Sling filters fire). Registering this component as an OSGi HTTP
+ * Whiteboard filter scoped to the {@code org.apache.sling} HTTP context places it between the
+ * Felix HTTP service and the Sling main servlet, so it is invoked for <em>every</em> request that
+ * reaches AEM and observes the response after the entire downstream chain has written it.
+ *
+ * <p>The {@code osgi.http.whiteboard.context.select} selector is mandatory: the Sling main servlet
+ * (which serves {@code /content}, {@code /libs}, {@code /apps}, asset binaries, etc.) is registered
+ * to the named whiteboard context {@code org.apache.sling}, NOT to the unnamed default context. A
+ * filter registered without this selector lands in the default context and is never invoked for
+ * AEM URLs.
  */
 @Component(
         service = Filter.class,
@@ -61,9 +79,16 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
         configurationPid = DownloadTrackingFilter.PID,
         configurationPolicy = ConfigurationPolicy.REQUIRE,
         property = {
-                "sling.filter.scope=REQUEST",
-                "sling.filter.pattern=/.*",
-                "service.ranking:Integer=-741"
+                // OSGi HTTP Whiteboard expects Servlet 3 path syntax (NOT regex). "/*" is the
+                // canonical "all requests" pattern. Regex like "/.*" would be rejected as Invalid.
+                "osgi.http.whiteboard.filter.pattern=/*",
+                "osgi.http.whiteboard.filter.dispatcher=REQUEST",
+                // Bind to the named whiteboard context that hosts AEM's Sling main servlet. Without
+                // this selector our filter lands in the default (empty) context and is never invoked.
+                "osgi.http.whiteboard.context.select=(osgi.http.whiteboard.context.name=org.apache.sling)",
+                // Sit just behind AuthenticationTrackingFilter (10000) so the user is already
+                // resolved on the request thread by the time we observe the download response.
+                "service.ranking:Integer=9000"
         })
 @Designate(ocd = DownloadTrackingFilter.DownloadFilterCfg.class)
 public final class DownloadTrackingFilter implements Filter {
@@ -99,9 +124,11 @@ public final class DownloadTrackingFilter implements Filter {
                                 + "extract_path_from_url (default false, when true the request URI minus the suffix is emitted as 'download_path'), "
                                 + "json_string_props (comma-list of jsonProp:dimensionName mappings — extracts string values), "
                                 + "json_array_props (comma-list of jsonProp:dimensionName mappings — extracts arrays of strings), "
+                                + "query_param_dimensions (comma-list of queryParam:dimensionName mappings — extracts request query string values into dimensions; useful for endpoints whose payload is binary so JSON inspection is unavailable), "
+                                + "query_params_required (comma-list of query parameter names that must be present and non-empty for the rule to fire), "
                                 + "priority (integer, lower checked first; defaults to declaration order).")
         String[] patterns() default {
-                "name=pattern_1_downloadbinaries;subtype=post_downloadbinaries_status_201"
+                "name=pattern_1_downloadbinaries_init;subtype=post_downloadbinaries_init_status_201"
                         + ";url_suffix=.downloadbinaries.json;method=POST;status=201"
                         + ";response_is_json=true;json_required_props=downloadId"
                         + ";extract_path_from_url=true;json_string_props=downloadId:download_id;priority=1",
@@ -112,7 +139,11 @@ public final class DownloadTrackingFilter implements Filter {
                         + ";json_array_props=assets:download_paths;priority=2",
                 "name=pattern_3_download_bin;subtype=get_download_bin_status_200"
                         + ";url_suffix=.download.bin;method=GET;status=200"
-                        + ";extract_path_from_url=true;priority=3"
+                        + ";extract_path_from_url=true;priority=3",
+                "name=pattern_4_downloadbinaries_fetch;subtype=get_downloadbinaries_fetch_status_200"
+                        + ";url_suffix=.downloadbinaries.json;method=GET;status=200"
+                        + ";query_params_required=downloadId,artifactId"
+                        + ";query_param_dimensions=downloadId:download_id,artifactId:download_artifact_id;priority=4"
         };
 
         @AttributeDefinition(
@@ -285,6 +316,10 @@ public final class DownloadTrackingFilter implements Filter {
             if (!rule.statusMatches(status)) {
                 continue;
             }
+            if (!rule.requiredQueryParams.isEmpty()
+                    && !allQueryParamsHaveValue(request, rule.requiredQueryParams)) {
+                continue;
+            }
 
             JsonNode root = null;
             if (rule.responseIsJson) {
@@ -316,6 +351,13 @@ public final class DownloadTrackingFilter implements Filter {
                     if (!fileName.isEmpty()) {
                         dims.put("download_file_name", trim(fileName, 512));
                     }
+                }
+            }
+
+            for (Map.Entry<String, String> mapping : rule.queryParamDimensions.entrySet()) {
+                String value = request.getParameter(mapping.getKey());
+                if (value != null && !value.isEmpty()) {
+                    dims.put(mapping.getValue(), trim(value, 1024));
                 }
             }
 
@@ -493,6 +535,10 @@ public final class DownloadTrackingFilter implements Filter {
         final Map<String, String> jsonStringProps;
         /** jsonPropName -> dimensionName */
         final Map<String, String> jsonArrayProps;
+        /** queryParamName -> dimensionName (used when the response body cannot or shouldn't be parsed) */
+        final Map<String, String> queryParamDimensions;
+        /** Query parameter names that must be present with a non-empty value for the rule to fire. */
+        final List<String> requiredQueryParams;
         final int priority;
         int declarationOrder;
 
@@ -500,7 +546,9 @@ public final class DownloadTrackingFilter implements Filter {
                 List<Integer> exactStatuses, boolean redirectBand, boolean anyStatus,
                 boolean responseIsJson, List<String> requiredJsonProps,
                 boolean extractPathFromUrl, Map<String, String> jsonStringProps,
-                Map<String, String> jsonArrayProps, int priority) {
+                Map<String, String> jsonArrayProps,
+                Map<String, String> queryParamDimensions, List<String> requiredQueryParams,
+                int priority) {
             this.name = name;
             this.subtype = subtype;
             this.urlSuffix = urlSuffix;
@@ -513,6 +561,8 @@ public final class DownloadTrackingFilter implements Filter {
             this.extractPathFromUrl = extractPathFromUrl;
             this.jsonStringProps = jsonStringProps;
             this.jsonArrayProps = jsonArrayProps;
+            this.queryParamDimensions = queryParamDimensions;
+            this.requiredQueryParams = requiredQueryParams;
             this.priority = priority;
         }
 
@@ -585,6 +635,8 @@ public final class DownloadTrackingFilter implements Filter {
         boolean extractPathFromUrl = parseBool(kv.get("extract_path_from_url"), false);
         Map<String, String> jsonStringProps = parseMappingPairs(kv.get("json_string_props"));
         Map<String, String> jsonArrayProps = parseMappingPairs(kv.get("json_array_props"));
+        Map<String, String> queryParamDimensions = parseMappingPairs(kv.get("query_param_dimensions"));
+        List<String> requiredQueryParams = csv(kv.get("query_params_required"));
 
         if (!requiredJsonProps.isEmpty() && !responseIsJson) {
             throw new IllegalArgumentException("json_required_props requires response_is_json=true");
@@ -614,6 +666,8 @@ public final class DownloadTrackingFilter implements Filter {
                 extractPathFromUrl,
                 Collections.unmodifiableMap(jsonStringProps),
                 Collections.unmodifiableMap(jsonArrayProps),
+                Collections.unmodifiableMap(queryParamDimensions),
+                Collections.unmodifiableList(requiredQueryParams),
                 priority);
     }
 
@@ -678,6 +732,7 @@ public final class DownloadTrackingFilter implements Filter {
             "name", "subtype", "url_suffix", "method", "status",
             "response_is_json", "json_required_props",
             "extract_path_from_url", "json_string_props", "json_array_props",
+            "query_param_dimensions", "query_params_required",
             "priority"));
 
     private static void validateKnownKeys(Set<String> keys) {
@@ -886,6 +941,16 @@ public final class DownloadTrackingFilter implements Filter {
             return false;
         }
         return path.regionMatches(true, path.length() - needle.length(), needle, 0, needle.length());
+    }
+
+    private static boolean allQueryParamsHaveValue(HttpServletRequest request, List<String> names) {
+        for (String name : names) {
+            String value = request.getParameter(name);
+            if (value == null || value.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String trim(String candidate, int max) {
