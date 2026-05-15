@@ -43,7 +43,7 @@ import org.osgi.service.component.annotations.ReferencePolicy;
  * extraction by an {@code AuthenticationHandler} — including handlers that never produce an
  * AEM-side login URL (IMS bearer, Technical Account JWT, custom OAuth handlers, ...).
  *
- * <h3>Two emit paths</h3>
+ * <h2>Two emit paths</h2>
  *
  * <p><b>Path A — URL-suffix gate (existing behaviour, preserved).</b><br>
  * For requests whose URI ends with {@code /j_security_check} or {@code /saml_login}, this
