@@ -143,6 +143,42 @@ public final class AuthenticationTrackingFilter implements Filter {
                         + ";url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token"
                         + ";form_params=j_username,j_password;priority=3"
         };
+
+        @AttributeDefinition(
+                name = "Generic auth fallback — enabled",
+                description =
+                        "When true, the AuthenticationCredentialsTracker (Sling AuthenticationInfoPostProcessor) "
+                                + "ALSO emits a single analytics event for every successful authentication whose "
+                                + "URL does NOT end with one of /j_security_check or /saml_login — i.e. for IMS, "
+                                + "Adobe Granite OAuth bearer, Technical Account JWT, and any other custom "
+                                + "AuthenticationHandler that authenticates the user without a Sling-handled login URL. "
+                                + "Per-HttpSession (and per-token, when no session exists) dedup ensures one event per "
+                                + "login, not per request.")
+        boolean genericAuthEnabled() default true;
+
+        @AttributeDefinition(
+                name = "Generic auth fallback — pattern name",
+                description = "Value placed in the auth_tracking_pattern dimension for the generic event.")
+        String genericAuthName() default "pattern_99_generic_auth";
+
+        @AttributeDefinition(
+                name = "Generic auth fallback — event subtype",
+                description = "Value placed in event_subtype for the generic event.")
+        String genericAuthSubtype() default "generic_auth_success";
+
+        @AttributeDefinition(
+                name = "Generic auth fallback — event type",
+                description = "Value placed in event_type for the generic event. Defaults to authentication_success "
+                        + "so it lands in the same ClickHouse table as the URL-pattern events.")
+        String genericAuthEventType() default "authentication_success";
+
+        @AttributeDefinition(
+                name = "Generic auth fallback — token dedup TTL (seconds)",
+                description = "How long a token-fingerprint dedup entry stays effective for stateless requests "
+                        + "(Bearer JWT / IMS / Technical Account) where no HttpSession is available. The same "
+                        + "(userId + Authorization header) within this TTL is treated as one login. "
+                        + "HttpSession-bound flows ignore this value and dedup for the lifetime of the session.")
+        int genericAuthTokenDedupTtlSeconds() default 1800;
     }
 
     /** Compiled snapshot of the declared rules. Volatile so {@link #doFilter} sees a coherent set. */
