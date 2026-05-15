@@ -239,6 +239,7 @@ public final class DownloadTrackingFilter implements Filter {
                 InfralytiqsAnalyticsPayload.builder("asset_download")
                         .eventSubtype(verdict.subtype)
                         .pageUrl(canonical(httpRequest))
+                        .lookupPath(httpRequest.getRequestURI())
                         .userIdHint(remoteUser)
                         .dimension("download_tracking_pattern", verdict.code)
                         .dimension("http_method", httpRequest.getMethod())

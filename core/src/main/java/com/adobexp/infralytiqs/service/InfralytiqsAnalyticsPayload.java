@@ -20,6 +20,14 @@ public final class InfralytiqsAnalyticsPayload {
     private final String eventSubtype;
     private final String pageUrl;
 
+    /**
+     * Routing key used by {@code InfralytiqsServiceImpl} to resolve which {@code TenantService}
+     * (apiServerURI / tenantId / siteId / dbName tuple) ships this event. Populated by the
+     * filter on the request thread, typically with {@code request.getRequestURI()}. Events
+     * whose lookupPath does not resolve to any tenant configuration are dropped by the service.
+     */
+    private final String lookupPath;
+
     /** Cheap hint captured on the request thread; the service resolves it asynchronously. */
     private final String userIdHint;
 
@@ -39,6 +47,7 @@ public final class InfralytiqsAnalyticsPayload {
         this.eventType = Objects.requireNonNull(b.eventType, "eventType");
         this.eventSubtype = b.eventSubtype;
         this.pageUrl = b.pageUrl != null ? b.pageUrl : "";
+        this.lookupPath = b.lookupPath != null ? b.lookupPath : "";
         this.userIdHint = b.userIdHint != null ? b.userIdHint : "";
         this.userId = b.userId != null ? b.userId : "";
         this.userEmail = b.userEmail != null ? b.userEmail : "";
@@ -63,6 +72,10 @@ public final class InfralytiqsAnalyticsPayload {
 
     public String pageUrl() {
         return pageUrl;
+    }
+
+    public String lookupPath() {
+        return lookupPath;
     }
 
     public String userIdHint() {
@@ -109,6 +122,7 @@ public final class InfralytiqsAnalyticsPayload {
                 new Builder(this.eventType)
                         .eventSubtype(this.eventSubtype)
                         .pageUrl(this.pageUrl)
+                        .lookupPath(this.lookupPath)
                         .userIdHint(this.userIdHint)
                         .userId(userId)
                         .userEmail(userEmail)
@@ -140,6 +154,7 @@ public final class InfralytiqsAnalyticsPayload {
         private final String eventType;
         private String eventSubtype;
         private String pageUrl = "";
+        private String lookupPath = "";
         private String userIdHint = "";
         private String userId = "";
         private String userEmail = "";
@@ -158,6 +173,15 @@ public final class InfralytiqsAnalyticsPayload {
 
         public Builder pageUrl(String v) {
             this.pageUrl = v;
+            return this;
+        }
+
+        /**
+         * Path used by the service to look up the {@code TenantService} configuration that
+         * owns this event. Typically {@code request.getRequestURI()}.
+         */
+        public Builder lookupPath(String v) {
+            this.lookupPath = v;
             return this;
         }
 

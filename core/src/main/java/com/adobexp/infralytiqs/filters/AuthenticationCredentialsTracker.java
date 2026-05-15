@@ -189,11 +189,11 @@ public final class AuthenticationCredentialsTracker implements AuthenticationInf
                     : rule.exactStatuses.get(0);
 
             InfralytiqsAnalyticsPayload payload = AuthenticationTrackingFilter.buildPayload(
-                    request, rule.name, rule.subtype, reportedStatus, userIdHint);
+                    request, rule.name, rule.subtype, rule.eventType, reportedStatus, userIdHint);
 
             ingest.enqueue(payload);
-            LOG.debug("[{}] post-process dispatched authentication analytics ({}) for {}",
-                    AuthenticationTrackingFilter.PID, rule.name,
+            LOG.debug("[{}] post-process dispatched {} analytics ({}) for {}",
+                    AuthenticationTrackingFilter.PID, rule.eventType, rule.name,
                     safeUserDisplay(userIdHint));
             return;
         }

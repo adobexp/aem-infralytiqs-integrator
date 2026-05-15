@@ -1,0 +1,7 @@
+{
+  "rootPath": "/content/example/site",
+  "tenantId": "example-tenant",
+  "siteId": "example-site-id",
+  "dbName": "PublicisDB",
+  "analyticsServerUrl": "http://localhost:8080"
+}

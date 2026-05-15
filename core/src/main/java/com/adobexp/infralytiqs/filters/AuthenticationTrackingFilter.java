@@ -122,6 +122,8 @@ public final class AuthenticationTrackingFilter implements Filter {
                         "One pattern per entry, written as 'key=value;key=value;...'. "
                                 + "Recognised keys: name (required, used as auth_tracking_pattern), "
                                 + "subtype (required, used as event_subtype), "
+                                + "event_type (optional, defaults to 'authentication_success'; set to 'logout' for "
+                                + "logout-style endpoints so events route to a distinct ClickHouse event_type), "
                                 + "url_suffix (required, case-insensitive ends-with), "
                                 + "method (required, e.g. POST or GET), "
                                 + "status (required, either a number, a comma-separated list, or 'redirect'), "
@@ -280,23 +282,29 @@ public final class AuthenticationTrackingFilter implements Filter {
         }
 
         InfralytiqsAnalyticsPayload payload = buildPayload(
-                effective, verdict.code, verdict.subtype, mirrored.terminalStatus(), remoteUser);
+                effective, verdict.code, verdict.subtype, verdict.eventType,
+                mirrored.terminalStatus(), remoteUser);
 
         ingest.enqueue(payload);
-        LOG.debug("[{}] dispatched authentication analytics ({})", PID, verdict.code);
+        LOG.debug("[{}] dispatched {} analytics ({})", PID, verdict.eventType, verdict.code);
     }
 
     /**
-     * Build the canonical {@code authentication_success} payload from request/match context.
+     * Build the canonical authentication / logout payload from request/match context.
      * Shared with {@link AuthenticationCredentialsTracker} so payloads from either entry point
      * (HTTP whiteboard filter for SAML/OIDC; Sling auth post-processor for {@code /j_security_check})
      * land in ClickHouse with identical schemas.
+     *
+     * <p>The {@code eventType} parameter is the rule's declared event type (default
+     * {@code authentication_success}; can be e.g. {@code logout}).
      */
     static InfralytiqsAnalyticsPayload buildPayload(HttpServletRequest request, String patternName,
-            String subtype, int httpStatus, String userIdHint) {
-        return InfralytiqsAnalyticsPayload.builder("authentication_success")
+            String subtype, String eventType, int httpStatus, String userIdHint) {
+        String resolvedEventType = (eventType == null || eventType.isEmpty()) ? DEFAULT_EVENT_TYPE : eventType;
+        return InfralytiqsAnalyticsPayload.builder(resolvedEventType)
                 .eventSubtype(subtype)
                 .pageUrl(canonical(request))
+                .lookupPath(request.getRequestURI())
                 .userIdHint(userIdHint)
                 .dimension("auth_tracking_pattern", patternName)
                 .dimension("http_method", request.getMethod())
@@ -342,7 +350,7 @@ public final class AuthenticationTrackingFilter implements Filter {
                     continue;
                 }
             }
-            return Match.of(rule.name, rule.subtype);
+            return Match.of(rule.name, rule.subtype, rule.eventType);
         }
         return Match.unmatched();
     }
@@ -469,31 +477,37 @@ public final class AuthenticationTrackingFilter implements Filter {
     /** Match outcome container. */
     private static final class Match {
 
-        private static final Match NO_MATCH = new Match(false, "", "");
+        private static final Match NO_MATCH = new Match(false, "", "", "");
 
         final boolean success;
         final String code;
         final String subtype;
+        final String eventType;
 
-        private Match(boolean success, String patternCode, String subtypeLabel) {
+        private Match(boolean success, String patternCode, String subtypeLabel, String eventTypeLabel) {
             this.success = success;
             code = patternCode;
             subtype = subtypeLabel;
+            eventType = eventTypeLabel;
         }
 
         static Match unmatched() {
             return NO_MATCH;
         }
 
-        static Match of(String patternLabel, String subtypeLabel) {
-            return new Match(true, patternLabel, subtypeLabel);
+        static Match of(String patternLabel, String subtypeLabel, String eventTypeLabel) {
+            return new Match(true, patternLabel, subtypeLabel, eventTypeLabel);
         }
     }
+
+    /** Default {@link InfralytiqsAnalyticsPayload#eventType()} emitted when a rule does not declare one. */
+    static final String DEFAULT_EVENT_TYPE = "authentication_success";
 
     /** Compiled, immutable representation of one configured pattern. */
     static final class MatchRule {
         final String name;
         final String subtype;
+        final String eventType;
         final String urlSuffix;
         final String method;
         final String responseCookie;
@@ -505,11 +519,12 @@ public final class AuthenticationTrackingFilter implements Filter {
         final int priority;
         int declarationOrder;
 
-        MatchRule(String name, String subtype, String urlSuffix, String method, String responseCookie,
-                List<Integer> exactStatuses, boolean redirectBand, List<String> queryParams,
-                List<String> formParams, String bodyContains, int priority) {
+        MatchRule(String name, String subtype, String eventType, String urlSuffix, String method,
+                String responseCookie, List<Integer> exactStatuses, boolean redirectBand,
+                List<String> queryParams, List<String> formParams, String bodyContains, int priority) {
             this.name = name;
             this.subtype = subtype;
+            this.eventType = eventType;
             this.urlSuffix = urlSuffix;
             this.method = method;
             this.responseCookie = responseCookie;
@@ -560,6 +575,10 @@ public final class AuthenticationTrackingFilter implements Filter {
 
         String name = required(kv, "name");
         String subtype = required(kv, "subtype");
+        String eventType = kv.getOrDefault("event_type", DEFAULT_EVENT_TYPE);
+        if (eventType.isEmpty()) {
+            eventType = DEFAULT_EVENT_TYPE;
+        }
         String urlSuffix = required(kv, "url_suffix");
         String method = required(kv, "method").toUpperCase(Locale.ROOT);
         String responseCookie = kv.getOrDefault("response_cookie", DEFAULT_LOGIN_COOKIE);
@@ -605,7 +624,7 @@ public final class AuthenticationTrackingFilter implements Filter {
 
         validateKnownKeys(kv.keySet());
 
-        return new MatchRule(name, subtype, urlSuffix, method, responseCookie,
+        return new MatchRule(name, subtype, eventType, urlSuffix, method, responseCookie,
                 Collections.unmodifiableList(exact), band,
                 Collections.unmodifiableList(queryParams),
                 Collections.unmodifiableList(formParams),
@@ -635,7 +654,7 @@ public final class AuthenticationTrackingFilter implements Filter {
     }
 
     private static final Set<String> KNOWN_KEYS = new LinkedHashSet<>(Arrays.asList(
-            "name", "subtype", "url_suffix", "method", "status",
+            "name", "subtype", "event_type", "url_suffix", "method", "status",
             "response_cookie", "query_params", "form_params", "body_contains", "priority"));
 
     private static void validateKnownKeys(Set<String> keys) {

@@ -1,0 +1,7 @@
+{
+  "rootPath": "/",
+  "tenantId": "arc-local",
+  "siteId": "px-arc-local-adobedam-com",
+  "dbName": "PublicisDB",
+  "analyticsServerUrl": "http://localhost:8080"
+}

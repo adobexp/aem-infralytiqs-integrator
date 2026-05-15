@@ -5,6 +5,8 @@ package com.adobexp.infralytiqs.service.impl;
 
 import com.adobexp.infralytiqs.service.InfralytiqsAnalyticsPayload;
 import com.adobexp.infralytiqs.service.InfralytiqsService;
+import com.adobexp.infralytiqs.service.TenantService;
+import com.adobexp.infralytiqs.service.TenantServiceManager;
 import com.adobexp.log.Logger;
 import com.adobexp.log.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -82,28 +84,12 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
 
     @ObjectClassDefinition(
             name = "Infralytiqs — analytics ingest configuration",
-            description = "Registers the Infralytiqs ingestion service toward st-ck-server (ClickHouse ingest).")
+            description = "Operational tuning for the Infralytiqs ingestion service. The per-event "
+                    + "destination (apiServerURI / tenantId / siteId / dbName) is resolved at send "
+                    + "time from a matching TenantService factory configuration via "
+                    + "TenantServiceManager#getConfigForPath(lookupPath). Events whose lookup path "
+                    + "does not resolve to any TenantService are dropped.")
     public @interface InfralytiqsServiceCfg {
-
-        @AttributeDefinition(
-                name = "API Server URI",
-                description = "st-ck-server root, e.g. http://localhost:8080 — trailing slashes are tolerated.")
-        String apiServerURI() default "http://localhost:8080";
-
-        @AttributeDefinition(
-                name = "Tenant Id",
-                description = "ClickHouse tenantId registered in IL moduleConfigurations on st-ck-server.")
-        String tenantId();
-
-        @AttributeDefinition(
-                name = "Site Id",
-                description = "ClickHouse siteId registered alongside tenantId on st-ck-server.")
-        String siteId();
-
-        @AttributeDefinition(
-                name = "ClickHouse DB Name",
-                description = "Logical ClickHouse database receiving the analytics rows (e.g. PublicisDB).")
-        String dbName();
 
         @AttributeDefinition(name = "Batch max events", description = "Events per POST (must be ≤ 1000 on server).") int batchMaxEvents() default 100;
 
@@ -202,6 +188,15 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
     private volatile ResourceResolverFactory resourceResolverFactory;
 
+    /**
+     * Mandatory reference to the tenant resolver. Per-event {@code lookupPath} is run through
+     * {@link TenantServiceManager#getConfigForPath(String)} on the worker thread; the matching
+     * {@link TenantService} supplies the routing tuple (apiServerURI / tenantId / siteId / dbName).
+     * Events without a match are dropped.
+     */
+    @Reference
+    private TenantServiceManager tenantServiceManager;
+
     private static final class UserProfile {
         final String userId;
         final String email;
@@ -272,9 +267,9 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         return java.net.URLEncoder.encode(raw.trim(), StandardCharsets.UTF_8).replace("+", "%20");
     }
 
-    private URI ingestEndpoint(InfralytiqsServiceCfg c) {
-        URI base = stripTrailingSlash(URI.create(c.apiServerURI().trim()));
-        String path = "/il/analytics/" + enc(c.tenantId()) + "/" + enc(c.siteId()) + "/events";
+    private static URI ingestEndpoint(TenantService tenant) {
+        URI base = stripTrailingSlash(URI.create(tenant.getAnalyticsServerUrl().trim()));
+        String path = "/il/analytics/" + enc(tenant.getTenantId()) + "/" + enc(tenant.getSiteId()) + "/events";
         return base.resolve(path);
     }
 
@@ -284,10 +279,6 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         stopTimer();
 
         this.cfg = Objects.requireNonNull(c, "configuration");
-        if (isBlank(c.apiServerURI()) || isBlank(c.tenantId()) || isBlank(c.siteId()) || isBlank(c.dbName())) {
-            throw new IllegalArgumentException(
-                    "apiServerURI, tenantId, siteId and dbName are mandatory and cannot be blank");
-        }
 
         int cap = Math.max(512, c.queueCapacity());
         this.queue = new LinkedBlockingQueue<>(cap);
@@ -319,12 +310,8 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                 timer.scheduleAtFixedRate(this::scheduledDrain, period, period, TimeUnit.MILLISECONDS);
 
         LOG.info(
-                "[{}] activated apiServerURI={}, tenant={}, site={}, db={}, batch={}, intervalMs={}, backlogCap={}, httpThreads={}",
+                "[{}] activated (per-event tenant routing via TenantServiceManager) batch={}, intervalMs={}, backlogCap={}, httpThreads={}",
                 PID,
-                c.apiServerURI(),
-                c.tenantId(),
-                c.siteId(),
-                c.dbName(),
                 c.batchMaxEvents(),
                 c.flushIntervalMs(),
                 c.queueCapacity(),
@@ -429,7 +416,8 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
     private void postBatchSync(List<InfralytiqsAnalyticsPayload> batch) {
         InfralytiqsServiceCfg live = cfg;
         java.net.http.HttpClient client = httpClient;
-        if (live == null || client == null || batch.isEmpty()) {
+        TenantServiceManager manager = tenantServiceManager;
+        if (live == null || client == null || manager == null || batch.isEmpty()) {
             requeue(batch);
             return;
         }
@@ -437,17 +425,57 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         // Async enrichment runs here, on the worker thread — never on a request thread.
         List<InfralytiqsAnalyticsPayload> enriched = enrichBatch(live, batch);
 
-        URI endpoint = ingestEndpoint(live);
-        byte[] body = AnalyticsJson.toJsonArray(enriched).getBytes(StandardCharsets.UTF_8);
+        // Resolve each event's tenant via TenantServiceManager.getConfigForPath(lookupPath) and
+        // group events whose resolved TenantService shares the same routing tuple. Events with
+        // no matching tenant are dropped (never requeued) per the integrator's contract.
+        LinkedHashMap<String, TenantGroup> groups = new LinkedHashMap<>();
+        int dropped = 0;
+        for (InfralytiqsAnalyticsPayload evt : enriched) {
+            TenantService tenant = manager.getConfigForPath(evt.lookupPath());
+            if (tenant == null
+                    || isBlank(tenant.getAnalyticsServerUrl())
+                    || isBlank(tenant.getTenantId())
+                    || isBlank(tenant.getSiteId())
+                    || isBlank(tenant.getDbName())) {
+                dropped++;
+                continue;
+            }
+            String key = tenant.getAnalyticsServerUrl().trim()
+                    + "|" + tenant.getTenantId().trim()
+                    + "|" + tenant.getSiteId().trim()
+                    + "|" + tenant.getDbName().trim();
+            TenantGroup group = groups.get(key);
+            if (group == null) {
+                group = new TenantGroup(tenant);
+                groups.put(key, group);
+            }
+            group.events.add(evt);
+        }
+
+        if (dropped > 0) {
+            LOG.warn("[{}] dropped {} event(s) with no matching TenantService configuration", PID, dropped);
+        }
+
+        for (TenantGroup group : groups.values()) {
+            sendGroup(live, client, group);
+        }
+    }
+
+    private void sendGroup(InfralytiqsServiceCfg live, java.net.http.HttpClient client, TenantGroup group) {
+        if (group.events.isEmpty()) {
+            return;
+        }
+        URI endpoint = ingestEndpoint(group.tenant);
+        byte[] body = AnalyticsJson.toJsonArray(group.events).getBytes(StandardCharsets.UTF_8);
 
         java.net.http.HttpRequest req =
                 java.net.http.HttpRequest.newBuilder(endpoint)
                         .timeout(Duration.ofSeconds(Math.max(1, live.httpTimeoutSeconds())))
                         .header("Accept", "application/json")
                         .header("Content-Type", "application/json; charset=UTF-8")
-                        .header("X-Infralytiqs-Tenant-Id", live.tenantId())
-                        .header("X-Infralytiqs-Site-Id", live.siteId())
-                        .header("X-Infralytiqs-DB-Name", live.dbName())
+                        .header("X-Infralytiqs-Tenant-Id", group.tenant.getTenantId())
+                        .header("X-Infralytiqs-Site-Id", group.tenant.getSiteId())
+                        .header("X-Infralytiqs-DB-Name", group.tenant.getDbName())
                         .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body))
                         .build();
 
@@ -456,18 +484,29 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                     client.send(req, java.net.http.HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             int code = rsp.statusCode();
             if (code >= 200 && code < 300) {
-                LOG.debug("[{}] ingest OK http={} events={}", PID, code, batch.size());
+                LOG.debug("[{}] ingest OK http={} events={} tenant={} site={}",
+                        PID, code, group.events.size(), group.tenant.getTenantId(), group.tenant.getSiteId());
                 return;
             }
-
-            LOG.warn("[{}] ingest HTTP {} → {}", PID, code, shorten(rsp.body()));
-            requeue(batch);
+            LOG.warn("[{}] ingest HTTP {} (tenant={} site={}) → {}",
+                    PID, code, group.tenant.getTenantId(), group.tenant.getSiteId(), shorten(rsp.body()));
+            requeue(group.events);
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            LOG.warn("[{}] ingest transport error: {}", PID, ex.toString());
-            requeue(batch);
+            LOG.warn("[{}] ingest transport error (tenant={} site={}): {}",
+                    PID, group.tenant.getTenantId(), group.tenant.getSiteId(), ex.toString());
+            requeue(group.events);
+        }
+    }
+
+    private static final class TenantGroup {
+        final TenantService tenant;
+        final List<InfralytiqsAnalyticsPayload> events = new ArrayList<>();
+
+        TenantGroup(TenantService tenant) {
+            this.tenant = tenant;
         }
     }
 
