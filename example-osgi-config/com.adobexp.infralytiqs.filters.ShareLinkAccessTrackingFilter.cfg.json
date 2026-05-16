@@ -1,0 +1,6 @@
+{
+  "marker": "infralytiqs-share-link-access-tracking-enabled",
+  "patterns": [
+    "name=pattern_1_share_link_view;subtype=share_link_view_status_200;url_suffix=/linkshare.html;method=GET;status=200;query_params_required=sh;query_param_dimensions=sh:share_token;priority=1"
+  ]
+}
