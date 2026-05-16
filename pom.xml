@@ -10,7 +10,7 @@
 
     <groupId>com.adobexp.infralytiqs</groupId>
     <artifactId>aem-infralytiqs-integrator</artifactId>
-    <version>1.0.5-SNAPSHOT</version>
+    <version>1.0.5</version>
     <packaging>pom</packaging>
 
     <name>AEM Infralytiqs Integrator - Reactor</name>
@@ -56,7 +56,7 @@
         <url>https://github.com/adobexp/aem-infralytiqs-integrator</url>
         <connection>scm:git:git@github.com:adobexp/aem-infralytiqs-integrator.git</connection>
         <developerConnection>scm:git:git@github.com:adobexp/aem-infralytiqs-integrator.git</developerConnection>
-        <tag>HEAD</tag>
+        <tag>aem-infralytiqs-integrator-1.0.5</tag>
     </scm>
 
     <build>
