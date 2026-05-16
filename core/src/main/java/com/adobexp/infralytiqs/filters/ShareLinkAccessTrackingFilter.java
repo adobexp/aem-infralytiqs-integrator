@@ -92,9 +92,10 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * explicit flush were dropped from the wire.
  *
  * <p>Phase 2 here does not do that. The body-inspecting writer ({@link TeePrintWriter}) is a
- * PrintWriter whose underlying {@code Writer} is {@link #super.getWriter()} itself — i.e. it
- * delegates directly to the container-owned PrintWriter chain that the container will flush on
- * commit. No intermediate {@code OutputStreamWriter} ever appears between us and the underlying
+ * PrintWriter whose underlying {@code Writer} is the container-owned writer returned by
+ * {@code super.getWriter()} on the response wrapper — i.e. it delegates directly to the
+ * container-owned PrintWriter chain that the container will flush on commit. No intermediate
+ * {@code OutputStreamWriter} ever appears between us and the underlying
  * stream. Every overridden write method calls {@code super.write(...)} (which is PrintWriter's
  * canonical {@code out.write(...)} → delegate) and then captures a side copy. Symmetrically,
  * {@link TeeServletOutputStream} writes to {@code super.getOutputStream()} first and only then
