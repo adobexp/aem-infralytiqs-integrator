@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.adobexp</groupId>
         <artifactId>central-maven-parent</artifactId>
-        <version>1.0.2</version>
+        <version>1.0.3</version>
     </parent>
 
     <groupId>com.adobexp.infralytiqs</groupId>
@@ -47,6 +47,13 @@
 
         <keyname>33C0330C91FCC3C1</keyname>
         <server>central</server>
+
+        <!-- Opt-in to flatten-maven-plugin so the POMs published to Maven Central
+             contain all required metadata (description, url, licenses, developers,
+             scm) inlined from the parent, and all dependency versions resolved.
+             The default in central-maven-parent is true; this overrides for the
+             whole reactor (also inherited by core and all). -->
+        <flatten.skip>false</flatten.skip>
 
         <maven-release-plugin>3.0.1</maven-release-plugin>
         <maven-scm-plugin>2.0.1</maven-scm-plugin>
