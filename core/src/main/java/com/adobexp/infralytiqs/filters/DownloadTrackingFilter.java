@@ -55,6 +55,13 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * outbound calls — the service handles batching, user-profile enrichment and HTTP shipping on its
  * own worker pool.
  *
+ * <p>This component is declared with {@link ConfigurationPolicy#REQUIRE} and {@link #PID}.
+ * Declarative Services therefore does not register the {@link Filter} service (and this filter
+ * does not run) until Configuration Admin has an entry for that PID — for example
+ * {@code com.adobexp.infralytiqs.filters.DownloadTrackingFilter} in the Felix console or a
+ * matching {@code cfg.json} in the deployment package. Ingestion still requires
+ * {@link InfralytiqsService} at runtime.
+ *
  * <h2>Registration: OSGi HTTP Whiteboard, not Sling filter</h2>
  *
  * <p>On AEMaaCS the asset download endpoints — {@code *.downloadbinaries.json} on author and
