@@ -101,13 +101,26 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * download-permission booleans — i.e. everything needed to attribute "user X shared asset Y at
  * time Z with policy P" in Infralytiqs.
  *
- * <h2>Registration — OSGi HTTP Whiteboard, not Sling filter</h2>
+ * <h2>Registration — OSGi HTTP Whiteboard, ALL named contexts</h2>
  *
- * <p>The {@code /adobe/repository} endpoint is a custom Adobe servlet that does not reliably
- * traverse the Sling main-servlet filter chain. As with
- * {@link DownloadTrackingFilter}, we register at the OSGi HTTP Whiteboard layer scoped to the
- * named context {@code org.apache.sling} so that we sit between the Felix HTTP service and the
- * Sling main servlet and observe every request that reaches AEM.
+ * <p>Unlike {@link DownloadTrackingFilter} (whose endpoints are unambiguously served by the
+ * Sling main servlet under {@code /content/dam/*} and therefore bind cleanly to the named
+ * whiteboard context {@code org.apache.sling}), the {@code /adobe/repository/*} endpoint is the
+ * Adobe Cloud Resource Hierarchy API. It is registered into AEMaaCS by Adobe-managed bundles
+ * (e.g. {@code com.adobe.granite.assetmanagement.crh.*}) and may live in a different OSGi HTTP
+ * Whiteboard context than the Sling main servlet. To guarantee we observe the request regardless
+ * of which named context Adobe picks for it, this component selects <em>every</em> named context
+ * via {@code (osgi.http.whiteboard.context.name=*)}.
+ *
+ * <p>The breadth of the binding is intentionally safe because:
+ * <ul>
+ *   <li>Pre-match is one URI {@code containsInsensitive} check per rule per request — microseconds
+ *       for non-matching requests.</li>
+ *   <li>The response wrapper is status-only; nothing about the response bytes can be perturbed
+ *       no matter what context the underlying servlet runs in.</li>
+ *   <li>Request body buffering is gated on Content-Type, declared Content-Length and the
+ *       configured byte cap — a non-matching request flows through untouched.</li>
+ * </ul>
  *
  * <p>This component is declared with {@link ConfigurationPolicy#REQUIRE} and {@link #PID}.
  * Declarative Services therefore does not register the {@link Filter} service (and this filter
@@ -125,8 +138,11 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
                 // canonical "all requests" pattern. Regex like "/.*" would be rejected as Invalid.
                 "osgi.http.whiteboard.filter.pattern=/*",
                 "osgi.http.whiteboard.filter.dispatcher=REQUEST",
-                // Bind to the named whiteboard context that hosts AEM's Sling main servlet.
-                "osgi.http.whiteboard.context.select=(osgi.http.whiteboard.context.name=org.apache.sling)",
+                // Bind to EVERY named whiteboard context. The /adobe/repository API is owned by
+                // Adobe-managed bundles and is not guaranteed to live in the Sling main context;
+                // binding to a single named context risked silently missing the share endpoint.
+                // See class JavaDoc for the safety analysis of this wider binding.
+                "osgi.http.whiteboard.context.select=(osgi.http.whiteboard.context.name=*)",
                 // Sit just behind DownloadTrackingFilter (9000) — both observe-only filters live
                 // here so the user is already resolved on the request thread when we record.
                 "service.ranking:Integer=8000"
@@ -161,11 +177,12 @@ public final class ShareAssetTrackingFilter implements Filter {
                                 + "name (required, used as share_tracking_pattern), "
                                 + "subtype (required, used as event_subtype), "
                                 + "url_suffix (case-insensitive ends-with — optional), "
-                                + "url_contains (case-insensitive substring match — optional, needed for endpoints "
-                                + "that carry matrix parameters such as /adobe/repository/;api=operations;t=NNNN; "
-                                + "note that the DSL itself uses ';' as the token separator, so values written here "
-                                + "must NOT contain ';' — match the substring AFTER the matrix-param introducer, "
-                                + "e.g. write 'api=operations' rather than ';api=operations'), "
+                                + "url_contains (case-insensitive substring match — optional, useful for endpoints "
+                                + "whose stable path prefix is followed by matrix parameters that the runtime may "
+                                + "or may not normalise away before this filter sees the URI; e.g. for the Adobe "
+                                + "Cloud Resource Hierarchy endpoint write 'url_contains=/adobe/repository' rather "
+                                + "than 'url_contains=api=operations'. NOTE: the DSL itself uses ';' as the token "
+                                + "separator, so values must NOT contain ';'), "
                                 + "at least one of url_suffix or url_contains is required, "
                                 + "method (required, e.g. POST), "
                                 + "status (required: numeric code, comma-list, 'redirect', or 'any'), "
@@ -180,8 +197,13 @@ public final class ShareAssetTrackingFilter implements Filter {
                                 + "DownloadTrackingFilter incident JavaDoc for why response wrapping breaks "
                                 + "AEMaaCS-backed JSON endpoints.")
         String[] patterns() default {
+                // Match the stable path prefix /adobe/repository — NOT the matrix-parameter
+                // segment ;api=operations;t=NNNN. Matrix params may be normalised away by the
+                // AEMaaCS dispatcher / Felix HTTP layer before this filter sees the URI, so a
+                // matrix-param-based check would silently fail in that case. Precision is restored
+                // by the tight gating on Content-Type and the JSON request body op below.
                 "name=pattern_1_share_link_create;subtype=share_link_create_status_200"
-                        + ";url_contains=api=operations;method=POST;status=200"
+                        + ";url_contains=/adobe/repository;method=POST;status=200"
                         + ";request_content_type_contains=asset-operation+json"
                         + ";request_body_op=share;priority=1"
         };
@@ -292,6 +314,16 @@ public final class ShareAssetTrackingFilter implements Filter {
 
         Match verdict = matchAny(candidates, effective, mirrored, buffered);
         if (!verdict.success) {
+            // The URL+method pre-match found candidate rules, but downstream gating (status,
+            // content-type, body op) did not produce a verdict. Emit a single line at DEBUG so
+            // operators can see why a request that "looked like" a share was not recorded —
+            // e.g. wrong status, body op != "share", body too large to buffer.
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("[{}] no rule matched URI={} method={} status={} ct={} (had {} candidate(s))",
+                        PID, effective.getRequestURI(), effective.getMethod(),
+                        mirrored.terminalStatus(),
+                        Objects.toString(effective.getContentType(), ""), candidates.size());
+            }
             return;
         }
 
