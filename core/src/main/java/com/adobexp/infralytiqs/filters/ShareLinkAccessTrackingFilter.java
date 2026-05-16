@@ -6,6 +6,7 @@ import com.adobexp.log.Logger;
 import com.adobexp.log.LoggerFactory;
 
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -16,11 +17,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
 import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
+import javax.servlet.ServletOutputStream;
+import javax.servlet.WriteListener;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpServletResponseWrapper;
@@ -59,34 +64,63 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * token directly in its {@code ?sh=…} query parameter. Observing this GET is sufficient to record
  * "a share link was accessed at time T by user U" attribution events.
  *
- * <h2>Phase-1 contract — pure status sniffer, no body inspection</h2>
+ * <h2>Phase 1 — status-only sniffing</h2>
  *
- * <p>This filter is deliberately the smallest thing that can work. It wraps the response with the
- * exact same status-only {@link ObservationResponse} the {@link DownloadTrackingFilter} uses —
- * which overrides only {@code setStatus} / {@code sendError} / {@code sendRedirect} / {@code reset}
- * and <strong>never</strong> {@code getOutputStream()} or {@code getWriter()}. Response bytes are
- * therefore physically untouched: the same incident that broke the download flow (truncation
- * caused by an OutputStreamWriter chain whose internal buffer the container never flushed) cannot
- * happen here.
+ * <p>Phase 1 wraps the response with a tiny status-only {@link ObservationResponse} (mirroring
+ * {@link DownloadTrackingFilter}) and extracts the {@code sh} query parameter as
+ * {@code share_token}. Zero per-byte overhead and zero risk of perturbing the response payload.
  *
- * <p>Captured dimensions (Phase 1):
+ * <h2>Phase 2 — optional HTML body inspection for {@code data-linkshare-path="…"} extraction</h2>
+ *
+ * <p>Phase 2 adds an opt-in body inspection path that extracts the list of shared asset paths
+ * from the rendered HTML. Enabled per-rule via {@code inspect_response_body=true}.
+ *
+ * <p>The rendered {@code /linkshare.html} page server-side encodes every shared asset twice — as
+ * {@code data-foundation-collection-item-id="/content/dam/.../foo.jpeg"} and as
+ * {@code data-linkshare-path="/content/dam/.../foo.jpeg"} — on each card and on each preview
+ * navigation href. Scanning for the {@code data-linkshare-path="…"} attribute is the simplest
+ * stable extraction (the attribute is specifically named for the share-page use case, unlike the
+ * more generic foundation-collection attribute).
+ *
+ * <h3>Safety contract — why this is not the download-filter incident again</h3>
+ *
+ * <p>The earlier {@link DownloadTrackingFilter} truncation bug happened because the response
+ * wrapper returned a freshly-constructed {@code PrintWriter} chain
+ * ({@code new PrintWriter(new OutputStreamWriter(new TeeServletOutputStream(super.getOutputStream(), …), enc))}).
+ * That chain has its own {@code OutputStreamWriter} char-to-byte buffer that the container never
+ * sees and therefore never flushes on commit — bytes written to that buffer after the last
+ * explicit flush were dropped from the wire.
+ *
+ * <p>Phase 2 here does not do that. The body-inspecting writer ({@link TeePrintWriter}) is a
+ * PrintWriter whose underlying {@code Writer} is {@link #super.getWriter()} itself — i.e. it
+ * delegates directly to the container-owned PrintWriter chain that the container will flush on
+ * commit. No intermediate {@code OutputStreamWriter} ever appears between us and the underlying
+ * stream. Every overridden write method calls {@code super.write(...)} (which is PrintWriter's
+ * canonical {@code out.write(...)} → delegate) and then captures a side copy. Symmetrically,
+ * {@link TeeServletOutputStream} writes to {@code super.getOutputStream()} first and only then
+ * captures a side copy. Container flush semantics are therefore identical to Phase 1; the side
+ * buffer is purely observational and cannot affect bytes on the wire.
+ *
+ * <h3>Performance bounds</h3>
+ *
  * <ul>
- *   <li>{@code share_token} — the opaque {@code sh} query parameter, used to correlate the access
- *       event with the matching creation event captured by {@link ShareAssetTrackingFilter} (or
- *       any future server-side share-store lookup).</li>
- *   <li>{@code share_tracking_pattern}, {@code http_method}, {@code http_status},
- *       {@code request_uri}, {@code user_agent} — standard observability dimensions, identical to
- *       what {@link DownloadTrackingFilter} emits.</li>
- *   <li>User ID via {@code getRemoteUser()} / {@code getUserPrincipal()} when the share viewer
- *       is authenticated (the {@code /linkshare.html} HAR shows {@code x-sky-isauth: 1} — i.e. an
- *       authenticated session is the typical case on AEMaaCS author).</li>
+ *   <li><b>Opt-in</b>. Body inspection only happens if at least one candidate rule has
+ *       {@code inspect_response_body=true}. Otherwise the response is wrapped with the Phase-1
+ *       status-only wrapper — no per-byte overhead, no allocation per write.</li>
+ *   <li><b>Hard byte cap.</b> The side buffer never grows beyond {@code responseBufferMaxBytes}
+ *       (default 256 KB; the largest realistic share landing page is ~80 KB). Once the cap is
+ *       hit, further chars/bytes continue to flow through to the container's writer/stream but
+ *       are no longer captured. The wire payload is always complete; only our side observation
+ *       is truncated.</li>
+ *   <li><b>Hard path cap.</b> The post-chain regex scan stops after
+ *       {@code maxExtractedAssetPaths} (default 100) unique paths have been collected, so even a
+ *       pathological response cannot turn extraction into a quadratic operation.</li>
+ *   <li><b>Compiled regex.</b> The {@code data-linkshare-path="([^"]+)"} pattern is compiled once
+ *       as a static field — no per-request compilation.</li>
+ *   <li><b>Single-pass scan.</b> Body inspection runs after the chain on a single string copy
+ *       (the toString() of the StringBuilder side buffer). For a 256 KB string this is sub-ms
+ *       on modern JVMs.</li>
  * </ul>
- *
- * <p>The list of shared assets is intentionally NOT extracted in Phase 1. Extracting it requires
- * either response-body parsing (the safer tee pattern on {@code super.getWriter()} is plausible
- * but still strictly more invasive than this filter) or a server-side JCR lookup of the share
- * record by token (which depends on AEM version-internal storage paths). Phase 2 will add one of
- * those once Phase 1 has proven the filter is being invoked at all in the live environment.
  *
  * <h2>Registration — OSGi HTTP Whiteboard, ALL named contexts</h2>
  *
@@ -97,8 +131,8 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * <ul>
  *   <li>Pre-match is a single URI {@code endsWith} / {@code contains} check per rule per
  *       request — microseconds for non-matching requests.</li>
- *   <li>The response wrapper is status-only, so wider exposure cannot perturb response bytes for
- *       any underlying servlet in any context.</li>
+ *   <li>The response wrapper is status-only by default. Body inspection requires an explicit
+ *       opt-in flag on a matching rule.</li>
  *   <li>It removes one entire class of "filter never fires because the endpoint runs in a
  *       different named context" debugging step — exactly the failure mode that frustrated the
  *       diagnosis of {@link ShareAssetTrackingFilter} on the CRH endpoint.</li>
@@ -137,13 +171,24 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
 
     private static final Logger LOG = LoggerFactory.getLogger(ShareLinkAccessTrackingFilter.class);
 
+    /**
+     * Compiled once at class load. The pattern matches the {@code data-linkshare-path="…"} HTML
+     * attribute the AEM Asset Share landing page emits on every shared asset card. We capture the
+     * value between the quotes — JCR paths cannot contain a literal {@code "} so the simple
+     * {@code [^"]+} group is safe and faster than any reluctant quantifier.
+     *
+     * <p>Compiled with CASE_INSENSITIVE not because AEM emits mixed case (it doesn't) but as a
+     * trivial guard against future markup changes that capitalise an attribute name.
+     */
+    private static final Pattern LINKSHARE_PATH_PATTERN =
+            Pattern.compile("data-linkshare-path=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
+
     @ObjectClassDefinition(
             name = "Infralytiqs Share Link Access Tracking Filter",
             description = "Felix activates this filter once a configuration PID is present and "
-                    + "declares at least one valid pattern. The filter is strictly observe-only: "
-                    + "it never modifies the request or response payload — it only records that a "
-                    + "share-link page was rendered, and extracts the opaque share token from the "
-                    + "query string.")
+                    + "declares at least one valid pattern. By default the filter is strictly "
+                    + "observe-only on the response side; opt-in HTML body inspection is "
+                    + "available per-rule via 'inspect_response_body=true' (see the rule DSL).")
     public @interface ShareLinkAccessFilterCfg {
 
         @AttributeDefinition(
@@ -169,22 +214,46 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
                                 + "must be present and non-empty), "
                                 + "query_param_dimensions (comma-list of queryParam:dimensionName "
                                 + "mappings — extracts request query string values into dimensions), "
-                                + "priority (integer, lower checked first; defaults to declaration order). "
-                                + "NOTE: response-body inspection is intentionally NOT supported in "
-                                + "Phase 1 — see the class JavaDoc for the planned Phase 2 follow-up.")
+                                + "inspect_response_body (default false; when true the filter buffers "
+                                + "the HTML response up to 'responseBufferMaxBytes' and extracts "
+                                + "shared asset paths from data-linkshare-path=\"…\" attributes — "
+                                + "see the class JavaDoc for the safety contract on response wrapping), "
+                                + "priority (integer, lower checked first; defaults to declaration order).")
         String[] patterns() default {
                 // Default rule: every successful render of /linkshare.html?sh=<token>. The 'sh'
                 // query param IS the opaque share token AEM hands recipients — recording its value
                 // is sufficient to correlate this view event with the matching creation event
                 // captured by ShareAssetTrackingFilter (or a future server-side share-store lookup).
+                // 'inspect_response_body=true' opts this rule into Phase 2 HTML body extraction
+                // so the emitted event also carries 'share_paths' (csv of shared asset paths) and
+                // 'share_asset_count'. See the class JavaDoc for the safety+performance contract.
                 "name=pattern_1_share_link_view;subtype=share_link_view_status_200"
                         + ";url_suffix=/linkshare.html;method=GET;status=200"
                         + ";query_params_required=sh"
-                        + ";query_param_dimensions=sh:share_token;priority=1"
+                        + ";query_param_dimensions=sh:share_token"
+                        + ";inspect_response_body=true;priority=1"
         };
+
+        @AttributeDefinition(
+                name = "Response body buffer max bytes",
+                description = "Hard cap on the in-memory response copy used by Phase 2 HTML body "
+                        + "inspection. Once the buffer is full the response keeps flowing through "
+                        + "to the wire unchanged — only the side observation is truncated. "
+                        + "Default 262144 (256 KB); the largest realistic /linkshare.html render "
+                        + "is ~80 KB.")
+        int responseBufferMaxBytes() default 262144;
+
+        @AttributeDefinition(
+                name = "Max extracted asset paths",
+                description = "Hard cap on how many shared asset paths Phase 2 will collect from "
+                        + "one response. Bounds the work done per matching request and the size "
+                        + "of the emitted 'share_paths' dimension. Default 100.")
+        int maxExtractedAssetPaths() default 100;
     }
 
     private volatile List<ShareLinkAccessRule> rules = Collections.emptyList();
+    private volatile int responseBufferMaxBytes = 262144;
+    private volatile int maxExtractedAssetPaths = 100;
 
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
     private volatile InfralytiqsService ingestPipeline;
@@ -221,12 +290,18 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         });
 
         this.rules = Collections.unmodifiableList(compiled);
+        // Floor both bounds at sensible minima so a misconfiguration can't disable extraction or
+        // create a 1-byte buffer that captures nothing useful.
+        this.responseBufferMaxBytes = Math.max(4096, cfg.responseBufferMaxBytes());
+        this.maxExtractedAssetPaths = Math.max(1, cfg.maxExtractedAssetPaths());
 
         if (compiled.isEmpty()) {
             LOG.warn("[{}] no valid share-link-access tracking patterns configured — filter will match nothing", PID);
         } else {
-            LOG.info("[{}] loaded {} share-link-access tracking pattern(s) (Phase 1: status-only, no body inspection)",
-                    PID, compiled.size());
+            boolean anyBodyInspection = compiled.stream().anyMatch(r -> r.inspectResponseBody);
+            LOG.info("[{}] loaded {} share-link-access tracking pattern(s); body-inspection={} (buffer cap={} bytes, path cap={})",
+                    PID, compiled.size(), anyBodyInspection ? "ENABLED" : "disabled",
+                    this.responseBufferMaxBytes, this.maxExtractedAssetPaths);
         }
     }
 
@@ -264,7 +339,21 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
             return;
         }
 
-        ObservationResponse mirrored = new ObservationResponse(httpResponse);
+        // Decide which response wrapper to use BEFORE the chain. If no candidate asked for body
+        // inspection on this request, we use the Phase-1 status-only wrapper — zero per-byte
+        // overhead and behaviour is byte-for-byte identical to what already shipped. Only if a
+        // candidate rule opted in do we install the Phase-2 tee writer/stream.
+        boolean bodyWanted = false;
+        for (ShareLinkAccessRule r : candidates) {
+            if (r.inspectResponseBody) {
+                bodyWanted = true;
+                break;
+            }
+        }
+
+        ObservationResponse mirrored = bodyWanted
+                ? new BodyInspectingResponse(httpResponse, responseBufferMaxBytes)
+                : new ObservationResponse(httpResponse);
 
         chain.doFilter(httpRequest, mirrored);
 
@@ -314,6 +403,18 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         for (Map.Entry<String, String> e : verdict.extractedDimensions.entrySet()) {
             b.dimension(e.getKey(), e.getValue());
         }
+        for (Map.Entry<String, Double> e : verdict.extractedMetrics.entrySet()) {
+            b.metric(e.getKey(), e.getValue());
+        }
+
+        // Phase 2: if this verdict's rule wanted body inspection and the wrapper actually
+        // captured something, run the HTML scan now and add the shared asset paths as dimensions.
+        // We do the regex scan post-chain (not per-write) so the request-thread cost during the
+        // response render stays trivial — the tee just appended chars to a side StringBuilder.
+        if (verdict.bodyExtraction && mirrored instanceof BodyInspectingResponse) {
+            BodyInspectingResponse bir = (BodyInspectingResponse) mirrored;
+            extractSharedAssetPathsInto(bir.capturedBody(), maxExtractedAssetPaths, b);
+        }
 
         ingest.enqueue(b.build());
         // INFO (not DEBUG) on purpose: this filter is brand new and the user needs an unambiguous
@@ -321,6 +422,56 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         // is naturally low (one line per share-link page view) so INFO is not noisy.
         LOG.info("[{}] dispatched share-link-access analytics (pattern={}, status={})",
                 PID, verdict.code, mirrored.terminalStatus());
+    }
+
+    /**
+     * Pulls every {@code data-linkshare-path="…"} attribute value out of the captured HTML body
+     * and stores the deduplicated, capped result as analytics dimensions / metrics on the supplied
+     * builder. No-op on an empty/null body — body inspection on a degenerate response simply does
+     * not add Phase-2 dimensions, leaving the event as a Phase-1-style record.
+     */
+    static void extractSharedAssetPathsInto(String body, int maxPaths,
+            InfralytiqsAnalyticsPayload.Builder builder) {
+        if (body == null || body.isEmpty()) {
+            return;
+        }
+        // LinkedHashSet preserves first-seen order for deterministic 'share_first_path' below and
+        // gives us O(1) dedup — the HTML repeats the same path on each card + on each preview
+        // href, so an 80 KB page typically contains the same value 3–4 times per asset.
+        Set<String> paths = new LinkedHashSet<>();
+        Matcher m = LINKSHARE_PATH_PATTERN.matcher(body);
+        while (m.find()) {
+            if (paths.size() >= maxPaths) {
+                break;
+            }
+            String value = m.group(1);
+            if (value != null && !value.isEmpty()) {
+                paths.add(value);
+            }
+        }
+
+        if (paths.isEmpty()) {
+            return;
+        }
+
+        // share_first_path: the lexically first path captured. Useful as a coarse pivot when the
+        // share contains only one asset (the typical case in the HAR sample).
+        String first = paths.iterator().next();
+        builder.dimension("share_first_path", trim(first, 2048));
+
+        builder.metric("share_asset_count", (double) paths.size());
+
+        // share_paths: comma-separated list of all captured paths, capped to 8 KB so a pathological
+        // share doesn't blow up the emitted event. ClickHouse handles String columns fine but our
+        // ingestion path bounds individual dimension values to keep payloads small.
+        StringBuilder csv = new StringBuilder();
+        for (String p : paths) {
+            if (csv.length() > 0) {
+                csv.append(',');
+            }
+            csv.append(p);
+        }
+        builder.dimension("share_paths", trim(csv.toString(), 8192));
     }
 
     private static List<ShareLinkAccessRule> preMatch(List<ShareLinkAccessRule> all, HttpServletRequest request) {
@@ -365,35 +516,42 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
                 }
             }
 
-            return Match.of(rule.name, rule.subtype, dims);
+            return Match.of(rule.name, rule.subtype, dims, Collections.emptyMap(), rule.inspectResponseBody);
         }
         return Match.unmatched();
     }
 
-    /** Match outcome carrier including extracted dimensions. */
+    /** Match outcome carrier including extracted dimensions/metrics and the body-extraction flag. */
     private static final class Match {
 
         private static final Match NO_MATCH =
-                new Match(false, "", "", Collections.emptyMap());
+                new Match(false, "", "", Collections.emptyMap(), Collections.emptyMap(), false);
 
         final boolean success;
         final String code;
         final String subtype;
         final Map<String, String> extractedDimensions;
+        final Map<String, Double> extractedMetrics;
+        /** True iff the winning rule asked for Phase 2 HTML body extraction. */
+        final boolean bodyExtraction;
 
-        private Match(boolean success, String code, String subtype, Map<String, String> dims) {
+        private Match(boolean success, String code, String subtype,
+                Map<String, String> dims, Map<String, Double> metrics, boolean bodyExtraction) {
             this.success = success;
             this.code = code;
             this.subtype = subtype;
             this.extractedDimensions = dims;
+            this.extractedMetrics = metrics;
+            this.bodyExtraction = bodyExtraction;
         }
 
         static Match unmatched() {
             return NO_MATCH;
         }
 
-        static Match of(String code, String subtype, Map<String, String> dims) {
-            return new Match(true, code, subtype, dims);
+        static Match of(String code, String subtype, Map<String, String> dims,
+                Map<String, Double> metrics, boolean bodyExtraction) {
+            return new Match(true, code, subtype, dims, metrics, bodyExtraction);
         }
     }
 
@@ -411,13 +569,15 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         final Map<String, String> queryParamDimensions;
         /** Query parameter names that must be present with a non-empty value for the rule to fire. */
         final List<String> requiredQueryParams;
+        /** When true the filter buffers the HTML response and extracts data-linkshare-path values. */
+        final boolean inspectResponseBody;
         final int priority;
         int declarationOrder;
 
         ShareLinkAccessRule(String name, String subtype, String urlSuffix, String urlContains,
                 String method, List<Integer> exactStatuses, boolean redirectBand, boolean anyStatus,
                 Map<String, String> queryParamDimensions, List<String> requiredQueryParams,
-                int priority) {
+                boolean inspectResponseBody, int priority) {
             this.name = name;
             this.subtype = subtype;
             this.urlSuffix = urlSuffix;
@@ -428,6 +588,7 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
             this.anyStatus = anyStatus;
             this.queryParamDimensions = queryParamDimensions;
             this.requiredQueryParams = requiredQueryParams;
+            this.inspectResponseBody = inspectResponseBody;
             this.priority = priority;
         }
 
@@ -462,8 +623,6 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
             String value = trimmed.substring(eq + 1).trim();
             kv.put(key, value);
         }
-
-        rejectBodyInspectionKeys(kv.keySet());
 
         String name = required(kv, "name");
         String subtype = required(kv, "subtype");
@@ -503,6 +662,7 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
 
         Map<String, String> queryParamDimensions = parseMappingPairs(kv.get("query_param_dimensions"));
         List<String> requiredQueryParams = csv(kv.get("query_params_required"));
+        boolean inspectResponseBody = parseBool(kv.get("inspect_response_body"), false);
 
         int priority = Integer.MAX_VALUE;
         String prio = kv.get("priority");
@@ -520,7 +680,14 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
                 Collections.unmodifiableList(exact), band, anyStatus,
                 Collections.unmodifiableMap(queryParamDimensions),
                 Collections.unmodifiableList(requiredQueryParams),
-                priority);
+                inspectResponseBody, priority);
+    }
+
+    private static boolean parseBool(String v, boolean dflt) {
+        if (v == null || v.isEmpty()) {
+            return dflt;
+        }
+        return "true".equalsIgnoreCase(v) || "yes".equalsIgnoreCase(v) || "1".equals(v);
     }
 
     private static Map<String, String> parseMappingPairs(String csv) {
@@ -576,28 +743,8 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
     private static final Set<String> KNOWN_KEYS = new LinkedHashSet<>(Arrays.asList(
             "name", "subtype", "url_suffix", "url_contains", "method", "status",
             "query_param_dimensions", "query_params_required",
+            "inspect_response_body",
             "priority"));
-
-    /**
-     * Phase-1 only allows the keys above. Any key that would imply body inspection (request or
-     * response) is rejected at activation time so a stale config from a future Phase 2 schema
-     * cannot silently leave the operator believing body extraction is happening when it is not.
-     */
-    private static final Set<String> REJECTED_BODY_KEYS = new LinkedHashSet<>(Arrays.asList(
-            "request_body_op", "request_content_type_contains",
-            "response_is_json", "response_is_html",
-            "extract_share_paths_from_html",
-            "html_extract_attribute"));
-
-    private static void rejectBodyInspectionKeys(Set<String> keys) {
-        for (String k : keys) {
-            if (REJECTED_BODY_KEYS.contains(k)) {
-                throw new IllegalArgumentException("body-inspection key '" + k
-                        + "' is not supported in Phase 1 — see ShareLinkAccessTrackingFilter "
-                        + "JavaDoc. Phase 2 will introduce safe HTML response inspection.");
-            }
-        }
-    }
 
     private static void validateKnownKeys(Set<String> keys) {
         for (String k : keys) {
@@ -617,7 +764,7 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
      * the terminal HTTP status. {@code getOutputStream()} / {@code getWriter()} are NOT overridden
      * so the response payload remains entirely owned by AEMaaCS.
      */
-    static final class ObservationResponse extends HttpServletResponseWrapper {
+    static class ObservationResponse extends HttpServletResponseWrapper {
 
         private int status = HttpServletResponse.SC_OK;
 
@@ -664,6 +811,223 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         public void reset() {
             status = HttpServletResponse.SC_OK;
             super.reset();
+        }
+    }
+
+    /**
+     * Phase 2 response wrapper that does status sniffing AND captures the response body for
+     * post-chain HTML extraction. The body-capture path is the careful tee design described in
+     * the class JavaDoc: every byte/char written passes through to the container-owned
+     * writer/stream FIRST (via {@code super.write(...)}) and only then gets copied into a side
+     * buffer. The container's commit logic therefore flushes the same underlying chain it always
+     * has — there is no intermediate {@code OutputStreamWriter} or {@code BufferedWriter} in the
+     * flush path that the container is unaware of.
+     */
+    static final class BodyInspectingResponse extends ObservationResponse {
+
+        /**
+         * Hard byte cap. Capture stops growing once this is reached; writes continue to flow
+         * through to the underlying response so the wire payload is unaffected.
+         */
+        private final int bodyCap;
+
+        /**
+         * Side buffer. Sized to {@code bodyCap} characters worst case so the StringBuilder never
+         * needs to resize beyond it. Allocated lazily on the first write so a wrapped response
+         * that never writes anything (e.g. an early sendError 401) costs only the wrapper object.
+         */
+        private StringBuilder body;
+
+        private TeePrintWriter cachedWriter;
+        private TeeServletOutputStream cachedStream;
+
+        BodyInspectingResponse(HttpServletResponse delegate, int bodyCap) {
+            super(delegate);
+            this.bodyCap = bodyCap;
+        }
+
+        String capturedBody() {
+            return body == null ? "" : body.toString();
+        }
+
+        // Sink invoked by the tee writer for every char actually written through to the
+        // container's writer. Cheap append; cap-stop is a single comparison.
+        private void captureChar(int c) {
+            if (body == null) {
+                body = new StringBuilder(Math.min(8192, bodyCap));
+            }
+            if (body.length() < bodyCap) {
+                body.append((char) c);
+            }
+        }
+
+        private void captureChars(char[] buf, int off, int len) {
+            if (body == null) {
+                body = new StringBuilder(Math.min(8192, bodyCap));
+            }
+            int remaining = bodyCap - body.length();
+            if (remaining <= 0) {
+                return;
+            }
+            int copy = Math.min(remaining, len);
+            body.append(buf, off, copy);
+        }
+
+        private void captureString(String s, int off, int len) {
+            if (body == null) {
+                body = new StringBuilder(Math.min(8192, bodyCap));
+            }
+            int remaining = bodyCap - body.length();
+            if (remaining <= 0) {
+                return;
+            }
+            int copy = Math.min(remaining, len);
+            body.append(s, off, off + copy);
+        }
+
+        // Byte-side capture used by TeeServletOutputStream. Decodes lazily via the response's
+        // declared character encoding (or UTF-8 by default — Sling pages on AEMaaCS declare
+        // text/html;charset=utf-8). Sub-optimal for partial multi-byte sequences but adequate
+        // for an observe-only buffer — we never need round-trip fidelity here.
+        private void captureBytes(byte[] buf, int off, int len) {
+            if (body == null) {
+                body = new StringBuilder(Math.min(8192, bodyCap));
+            }
+            int remaining = bodyCap - body.length();
+            if (remaining <= 0) {
+                return;
+            }
+            String enc = getCharacterEncoding();
+            if (enc == null || enc.isEmpty()) {
+                enc = "UTF-8";
+            }
+            try {
+                String chunk = new String(buf, off, len, enc);
+                int copy = Math.min(remaining, chunk.length());
+                body.append(chunk, 0, copy);
+            } catch (java.io.UnsupportedEncodingException ignored) {
+                // Skip the chunk on encoding failure — better to lose observation than corrupt.
+            }
+        }
+
+        @Override
+        public PrintWriter getWriter() throws IOException {
+            if (cachedStream != null) {
+                throw new IllegalStateException("getOutputStream() already called on response");
+            }
+            if (cachedWriter == null) {
+                cachedWriter = new TeePrintWriter(super.getWriter(), this);
+            }
+            return cachedWriter;
+        }
+
+        @Override
+        public ServletOutputStream getOutputStream() throws IOException {
+            if (cachedWriter != null) {
+                throw new IllegalStateException("getWriter() already called on response");
+            }
+            if (cachedStream == null) {
+                cachedStream = new TeeServletOutputStream(super.getOutputStream(), this);
+            }
+            return cachedStream;
+        }
+    }
+
+    /**
+     * PrintWriter whose underlying {@code Writer} ({@code out}) is the container-owned writer
+     * returned by {@code super.getWriter()}. Every overridden write delegates to
+     * {@code super.write(...)} (which immediately forwards to the container writer — PrintWriter
+     * itself is not a buffered writer) and then captures the same chars to the wrapper's side
+     * buffer. Container flush semantics are unchanged.
+     */
+    static final class TeePrintWriter extends PrintWriter {
+
+        private final BodyInspectingResponse sink;
+
+        TeePrintWriter(PrintWriter delegate, BodyInspectingResponse sink) {
+            // autoFlush=false matches the constructor used internally by every standard servlet
+            // container's getWriter() — we are wrapping, not replacing, the container's writer,
+            // so we copy its flush policy.
+            super(delegate, false);
+            this.sink = sink;
+        }
+
+        @Override
+        public void write(int c) {
+            super.write(c);
+            sink.captureChar(c);
+        }
+
+        @Override
+        public void write(char[] buf, int off, int len) {
+            super.write(buf, off, len);
+            sink.captureChars(buf, off, len);
+        }
+
+        @Override
+        public void write(String s, int off, int len) {
+            super.write(s, off, len);
+            sink.captureString(s, off, len);
+        }
+
+        // write(char[]) and write(String) inherit from PrintWriter and route through the
+        // (off, len) variants above, so we capture those as well without explicit overrides.
+        // print(...) and println(...) all reduce to write(String) / write(int) eventually.
+    }
+
+    /**
+     * ServletOutputStream sibling of {@link TeePrintWriter}. Same contract: write to the
+     * container-owned stream FIRST, then copy to the side buffer. Used only when the servlet
+     * chose to render via {@code getOutputStream()} instead of {@code getWriter()} — uncommon
+     * for Sling-rendered HTML but supported for completeness.
+     */
+    static final class TeeServletOutputStream extends ServletOutputStream {
+
+        private final ServletOutputStream delegate;
+        private final BodyInspectingResponse sink;
+
+        TeeServletOutputStream(ServletOutputStream delegate, BodyInspectingResponse sink) {
+            this.delegate = delegate;
+            this.sink = sink;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            delegate.write(b);
+            byte[] single = {(byte) b};
+            sink.captureBytes(single, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] b) throws IOException {
+            delegate.write(b);
+            sink.captureBytes(b, 0, b.length);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            delegate.write(b, off, len);
+            sink.captureBytes(b, off, len);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        @Override
+        public boolean isReady() {
+            return delegate.isReady();
+        }
+
+        @Override
+        public void setWriteListener(WriteListener writeListener) {
+            delegate.setWriteListener(writeListener);
         }
     }
 

@@ -177,13 +177,8 @@ public final class ShareAssetTrackingFilter implements Filter {
                                 + "name (required, used as share_tracking_pattern), "
                                 + "subtype (required, used as event_subtype), "
                                 + "url_suffix (case-insensitive ends-with — optional), "
-                                + "url_contains (case-insensitive substring match — optional, useful for endpoints "
-                                + "whose stable path prefix is followed by matrix parameters that the runtime may "
-                                + "or may not normalise away before this filter sees the URI; e.g. for the Adobe "
-                                + "Cloud Resource Hierarchy endpoint write 'url_contains=/adobe/repository' rather "
-                                + "than 'url_contains=api=operations'. NOTE: the DSL itself uses ';' as the token "
-                                + "separator, so values must NOT contain ';'), "
-                                + "at least one of url_suffix or url_contains is required, "
+                                + "url_contains (case-insensitive substring match — optional. NOTE: the "
+                                + "DSL itself uses ';' as the token separator, so values must NOT contain ';'), "
                                 + "method (required, e.g. POST), "
                                 + "status (required: numeric code, comma-list, 'redirect', or 'any'), "
                                 + "request_content_type_contains (optional, case-insensitive substring "
@@ -193,17 +188,29 @@ public final class ShareAssetTrackingFilter implements Filter {
                                 + "query_params_required (comma-list of query parameter names that must be present), "
                                 + "query_param_dimensions (comma-list of queryParam:dimensionName mappings), "
                                 + "priority (integer, lower checked first; defaults to declaration order). "
+                                + "AT LEAST ONE of {url_suffix, url_contains, request_content_type_contains, "
+                                + "request_body_op} MUST be set — a rule without any discriminator would "
+                                + "match every request and is rejected at activation time. "
                                 + "NOTE: response-body inspection is intentionally NOT supported — see the "
                                 + "DownloadTrackingFilter incident JavaDoc for why response wrapping breaks "
                                 + "AEMaaCS-backed JSON endpoints.")
         String[] patterns() default {
-                // Match the stable path prefix /adobe/repository — NOT the matrix-parameter
-                // segment ;api=operations;t=NNNN. Matrix params may be normalised away by the
-                // AEMaaCS dispatcher / Felix HTTP layer before this filter sees the URI, so a
-                // matrix-param-based check would silently fail in that case. Precision is restored
-                // by the tight gating on Content-Type and the JSON request body op below.
-                "name=pattern_1_share_link_create;subtype=share_link_create_status_200"
-                        + ";url_contains=/adobe/repository;method=POST;status=200"
+                // Default rule deliberately has NO url_suffix / url_contains. Earlier revisions
+                // tried url_suffix=/adobe/repository and then url_contains=/adobe/repository on
+                // the wildcard-context binding; neither caused the filter's doFilter to fire,
+                // which strongly suggests the AEM Cloud Resource Hierarchy endpoint's URI on the
+                // wire — by the time it would reach Felix HTTP Whiteboard — no longer matches
+                // those literal prefixes (matrix-param normalisation, dispatcher rewrites and
+                // Adobe-owned servlet routing all sit between the browser and this filter).
+                //
+                // We therefore gate purely on what the REQUEST CARRIES: a POST with the
+                // application/vnd.adobe.asset-operation+json content type whose JSON body's "op"
+                // field is "share". That gate is conservative — Adobe's CRH uses this content
+                // type only for asset operations, and request_body_op=share matches only
+                // share-link-create calls. Status 200 OR 201 covers both AEM's documented
+                // success codes for this endpoint.
+                "name=pattern_1_share_by_op;subtype=share_link_create_status_2xx"
+                        + ";method=POST;status=200,201"
                         + ";request_content_type_contains=asset-operation+json"
                         + ";request_body_op=share;priority=1"
         };
@@ -315,15 +322,19 @@ public final class ShareAssetTrackingFilter implements Filter {
         Match verdict = matchAny(candidates, effective, mirrored, buffered);
         if (!verdict.success) {
             // The URL+method pre-match found candidate rules, but downstream gating (status,
-            // content-type, body op) did not produce a verdict. Emit a single line at DEBUG so
-            // operators can see why a request that "looked like" a share was not recorded —
-            // e.g. wrong status, body op != "share", body too large to buffer.
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("[{}] no rule matched URI={} method={} status={} ct={} (had {} candidate(s))",
-                        PID, effective.getRequestURI(), effective.getMethod(),
-                        mirrored.terminalStatus(),
-                        Objects.toString(effective.getContentType(), ""), candidates.size());
-            }
+            // content-type, body op) did not produce a verdict. Emit a single line at INFO so
+            // operators can see — without having to enable DEBUG on this class — that the filter
+            // DID see the request but rejected it, and exactly which gate it failed (status,
+            // content-type, body op). This is the primary diagnostic for "filter is registered
+            // but never fires" investigations: presence of this line proves the request reached
+            // doFilter and was rejected by gating; absence proves the request never reached us
+            // at all (and we need a different registration mechanism).
+            LOG.info("[{}] near-miss — no rule matched URI={} method={} status={} ct={} buffered-body={} (had {} candidate(s))",
+                    PID, effective.getRequestURI(), effective.getMethod(),
+                    mirrored.terminalStatus(),
+                    Objects.toString(effective.getContentType(), ""),
+                    (buffered != null && buffered.hasCachedBody()) ? buffered.cachedBody().length : -1,
+                    candidates.size());
             return;
         }
 
@@ -359,12 +370,23 @@ public final class ShareAssetTrackingFilter implements Filter {
         }
 
         ingest.enqueue(b.build());
-        LOG.debug("[{}] dispatched share analytics ({})", PID, verdict.code);
+        // INFO (not DEBUG) on purpose — symmetric with the near-miss log above so the user gets
+        // an unambiguous positive signal in the AEMaaCS log that a share-create event was
+        // captured. Volume is naturally low (one line per share-link creation) so INFO is fine.
+        LOG.info("[{}] dispatched share analytics (pattern={}, status={})",
+                PID, verdict.code, mirrored.terminalStatus());
     }
 
     private static List<ShareRule> preMatch(List<ShareRule> all, HttpServletRequest request) {
         String method = Objects.toString(request.getMethod(), "GET");
         String uri = Objects.toString(request.getRequestURI(), "");
+        // Resolve the request Content-Type once outside the per-rule loop. We push the
+        // content-type check up here (instead of leaving it only in matchAny) so that requests
+        // whose Content-Type cannot match any rule exit BEFORE we allocate a candidates list, a
+        // response wrapper, and — critically — BEFORE we emit the near-miss INFO log in
+        // doFilter. Without this pre-filter, a URL-less rule like the default one would treat
+        // every POST as a candidate and the near-miss log would fire for every unrelated POST.
+        String requestCt = null;
         List<ShareRule> out = null;
         for (ShareRule r : all) {
             if (!r.method.equalsIgnoreCase(method)) {
@@ -375,6 +397,14 @@ public final class ShareAssetTrackingFilter implements Filter {
             }
             if (!r.urlContains.isEmpty() && !containsInsensitive(uri, r.urlContains)) {
                 continue;
+            }
+            if (!r.requestContentTypeContains.isEmpty()) {
+                if (requestCt == null) {
+                    requestCt = Objects.toString(request.getContentType(), "");
+                }
+                if (!containsInsensitive(requestCt, r.requestContentTypeContains)) {
+                    continue;
+                }
             }
             if (out == null) {
                 out = new ArrayList<>(2);
@@ -681,10 +711,27 @@ public final class ShareAssetTrackingFilter implements Filter {
         String subtype = required(kv, "subtype");
         String urlSuffix = kv.getOrDefault("url_suffix", "");
         String urlContains = kv.getOrDefault("url_contains", "");
-        if (urlSuffix.isEmpty() && urlContains.isEmpty()) {
-            throw new IllegalArgumentException("at least one of 'url_suffix' or 'url_contains' must be set");
-        }
+        // URL match is INTENTIONALLY optional. Earlier revisions required one of url_suffix or
+        // url_contains, which forced every rule to commit to a stable path prefix — and that
+        // assumption broke on the AEM Cloud Resource Hierarchy endpoint
+        // (POST /adobe/repository/;api=operations;t=NNNN), where the URI on the wire may already
+        // have been rewritten / normalised by the time it reaches our filter and no part of the
+        // declared prefix is guaranteed to be present. We therefore allow a rule that gates on
+        // method + content-type + request body op alone — this is sufficient precision for the
+        // CRH share-create endpoint, where the JSON request body's "op":"share" field is the true
+        // discriminator. The body-op + content-type gating keeps the match conservative even
+        // without a URL filter; mismatched requests still exit quickly during matchAny().
         String method = required(kv, "method").toUpperCase(Locale.ROOT);
+
+        String requestContentTypeContains = kv.getOrDefault("request_content_type_contains", "");
+        String requestBodyOp = kv.getOrDefault("request_body_op", "");
+        if (urlSuffix.isEmpty() && urlContains.isEmpty()
+                && requestContentTypeContains.isEmpty() && requestBodyOp.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "rule has no discriminator — at least one of url_suffix, url_contains, "
+                            + "request_content_type_contains or request_body_op must be set so we do "
+                            + "not match every request");
+        }
 
         String statusSpec = required(kv, "status");
         List<Integer> exact = new ArrayList<>();
@@ -713,8 +760,6 @@ public final class ShareAssetTrackingFilter implements Filter {
             throw new IllegalArgumentException("status must specify at least one numeric code, 'redirect', or 'any'");
         }
 
-        String requestContentTypeContains = kv.getOrDefault("request_content_type_contains", "");
-        String requestBodyOp = kv.getOrDefault("request_body_op", "");
         Map<String, String> queryParamDimensions = parseMappingPairs(kv.get("query_param_dimensions"));
         List<String> requiredQueryParams = csv(kv.get("query_params_required"));
 
