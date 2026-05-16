@@ -4,13 +4,8 @@ import com.adobexp.infralytiqs.service.InfralytiqsAnalyticsPayload;
 import com.adobexp.infralytiqs.service.InfralytiqsService;
 import com.adobexp.log.Logger;
 import com.adobexp.log.LoggerFactory;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -26,8 +21,6 @@ import javax.servlet.Filter;
 import javax.servlet.FilterChain;
 import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
-import javax.servlet.ServletOutputStream;
-import javax.servlet.WriteListener;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpServletResponseWrapper;
@@ -47,13 +40,44 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * Captures asset download completions described by a fully-configurable list of {@link DownloadRule}s
  * and dispatches the event asynchronously through {@link InfralytiqsService}.
  *
- * <p>The filter wraps the response with a tee'd output stream <em>only</em> when at least one
- * candidate rule for the current URL+method requires JSON body inspection — so requests that aren't
- * downloads pay zero buffering cost. All HTTP I/O on the request thread is bounded by:
- * (a) the cheap URL-suffix lookup, (b) the capped {@code responseBufferMaxBytes} byte copy of the
- * response (default 256 KB), and (c) a single non-blocking enqueue. No JCR work, no synchronous
- * outbound calls — the service handles batching, user-profile enrichment and HTTP shipping on its
- * own worker pool.
+ * <h2>Strictly observe-only — no request or response payload mutation</h2>
+ *
+ * <p>This filter is deliberately non-invasive. It wraps the response with a tiny status-sniffing
+ * {@link ObservationResponse} that mirrors the pattern used by {@link AuthenticationTrackingFilter}:
+ * the wrapper overrides only {@code setStatus}, {@code sendError}, {@code sendRedirect} and
+ * {@code reset} so that the terminal HTTP status can be observed after the chain returns. It
+ * <strong>never</strong> overrides {@code getOutputStream()} or {@code getWriter()}, and it never
+ * touches request or response bytes. This guarantees that AEMaaCS's own asset-download handlers
+ * (and the Fastly streaming layer that fronts them, see {@code accept-ranges} / {@code x-served-by}
+ * headers on {@code *.downloadbinaries.json} responses) keep ownership of the response stream and
+ * its commit semantics.
+ *
+ * <p>An earlier revision of this filter tee'd the response body via a custom
+ * {@code ServletOutputStream} / {@code PrintWriter} pair so it could parse the JSON returned by
+ * {@code POST *.downloadbinaries.json} (to extract {@code downloadId}, etc). That broke the AEMaaCS
+ * download flow in three reinforcing ways:
+ * <ol>
+ *   <li>The replacement {@code PrintWriter} created from {@code super.getOutputStream()} was never
+ *       the writer the container/Sling/Adobe asset servlet expected, so on response commit the
+ *       container flushed the underlying stream rather than our wrapper's internal char buffer —
+ *       trailing JSON bytes were therefore dropped, but {@code Content-Length} (already set by the
+ *       asset servlet) still advertised the full length, leaving the client with a truncated /
+ *       invalid JSON payload.</li>
+ *   <li>The wrapper defaulted to {@code UTF-8} encoding when the response hadn't declared a charset,
+ *       which can disagree with the container default ({@code ISO-8859-1}) and shift byte counts
+ *       relative to the pre-computed {@code Content-Length}.</li>
+ *   <li>AEMaaCS internally also wraps the download response. Whichever wrapper first overrides
+ *       {@code getOutputStream()} / {@code getWriter()} wins, and Adobe's downstream code then
+ *       observes our stream instead of the original — silently breaking their own streaming
+ *       semantics.</li>
+ * </ol>
+ *
+ * <p>The {@code downloadId} / {@code artifactId} we used to extract from the POST body are also
+ * present in the query string of the immediately following
+ * {@code GET /content/dam.downloadbinaries.json?downloadId=...&artifactId=...} fetch — which we
+ * track via {@code pattern_4_downloadbinaries_fetch}. We therefore lose nothing important by
+ * dropping body inspection: the actual download event still carries the IDs, and the POST init
+ * event still carries the source asset path via {@code extract_path_from_url=true}.
  *
  * <p>This component is declared with {@link ConfigurationPolicy#REQUIRE} and {@link #PID}.
  * Declarative Services therefore does not register the {@link Filter} service (and this filter
@@ -104,12 +128,11 @@ public final class DownloadTrackingFilter implements Filter {
 
     private static final Logger LOG = LoggerFactory.getLogger(DownloadTrackingFilter.class);
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-
     @ObjectClassDefinition(
             name = "Infralytiqs Download Tracking Filter",
             description = "Felix activates this sling filter once a configuration PID is present "
-                    + "and declares at least one valid download pattern.")
+                    + "and declares at least one valid download pattern. The filter is strictly "
+                    + "observe-only: it never modifies the request or response payload.")
     public @interface DownloadFilterCfg {
 
         @AttributeDefinition(
@@ -126,24 +149,19 @@ public final class DownloadTrackingFilter implements Filter {
                                 + "url_suffix (required, case-insensitive ends-with), "
                                 + "method (required, POST or GET), "
                                 + "status (required: numeric code, comma-list, 'redirect', or 'any'), "
-                                + "response_is_json (default false, set true to capture+parse the response body), "
-                                + "json_required_props (comma-list of JSON property names that must be present and non-null), "
-                                + "extract_path_from_url (default false, when true the request URI minus the suffix is emitted as 'download_path'), "
-                                + "json_string_props (comma-list of jsonProp:dimensionName mappings — extracts string values), "
-                                + "json_array_props (comma-list of jsonProp:dimensionName mappings — extracts arrays of strings), "
-                                + "query_param_dimensions (comma-list of queryParam:dimensionName mappings — extracts request query string values into dimensions; useful for endpoints whose payload is binary so JSON inspection is unavailable), "
+                                + "extract_path_from_url (default false, when true the request URI minus the suffix is emitted as 'download_path' along with derived 'download_file_name' / 'download_file_type'), "
+                                + "query_param_dimensions (comma-list of queryParam:dimensionName mappings — extracts request query string values into dimensions), "
                                 + "query_params_required (comma-list of query parameter names that must be present and non-empty for the rule to fire), "
-                                + "priority (integer, lower checked first; defaults to declaration order).")
+                                + "priority (integer, lower checked first; defaults to declaration order). "
+                                + "NOTE: response body inspection is intentionally NOT supported — "
+                                + "see the class JavaDoc for why response wrapping breaks AEMaaCS downloads.")
         String[] patterns() default {
                 "name=pattern_1_downloadbinaries_init;subtype=post_downloadbinaries_init_status_201"
                         + ";url_suffix=.downloadbinaries.json;method=POST;status=201"
-                        + ";response_is_json=true;json_required_props=downloadId"
-                        + ";extract_path_from_url=true;json_string_props=downloadId:download_id;priority=1",
+                        + ";extract_path_from_url=true;priority=1",
                 "name=pattern_2_renditions_zip;subtype=post_download_asset_renditions_zip_status_200"
-                        + ";url_suffix=download-asset-renditions.zip;method=POST;status=200"
-                        + ";response_is_json=true;json_required_props=id,assets,archiveName"
-                        + ";json_string_props=id:download_id,archiveName:download_archive_name"
-                        + ";json_array_props=assets:download_paths;priority=2",
+                        + ";url_suffix=download-asset-renditions.zip;method=POST;status=200,201"
+                        + ";extract_path_from_url=true;priority=2",
                 "name=pattern_3_download_bin;subtype=get_download_bin_status_200"
                         + ";url_suffix=.download.bin;method=GET;status=200"
                         + ";extract_path_from_url=true;priority=3",
@@ -152,17 +170,9 @@ public final class DownloadTrackingFilter implements Filter {
                         + ";query_params_required=downloadId,artifactId"
                         + ";query_param_dimensions=downloadId:download_id,artifactId:download_artifact_id;priority=4"
         };
-
-        @AttributeDefinition(
-                name = "Response buffer max bytes",
-                description = "Hard cap on the in-memory response copy used for JSON parsing. "
-                        + "If a response exceeds this size while a JSON-asserting rule is active, "
-                        + "the rule will not match (we won't ship a truncated payload).")
-        int responseBufferMaxBytes() default 262144;
     }
 
     private volatile List<DownloadRule> rules = Collections.emptyList();
-    private volatile int responseBufferMaxBytes = 262144;
 
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
     private volatile InfralytiqsService ingestPipeline;
@@ -199,13 +209,12 @@ public final class DownloadTrackingFilter implements Filter {
         });
 
         this.rules = Collections.unmodifiableList(compiled);
-        this.responseBufferMaxBytes = Math.max(4096, cfg.responseBufferMaxBytes());
 
         if (compiled.isEmpty()) {
             LOG.warn("[{}] no valid download tracking patterns configured — filter will match nothing", PID);
         } else {
-            LOG.info("[{}] loaded {} download tracking pattern(s); response buffer cap = {} bytes",
-                    PID, compiled.size(), this.responseBufferMaxBytes);
+            LOG.info("[{}] loaded {} download tracking pattern(s) (observe-only, no body inspection)",
+                    PID, compiled.size());
         }
     }
 
@@ -241,16 +250,7 @@ public final class DownloadTrackingFilter implements Filter {
             return;
         }
 
-        boolean needsBody = false;
-        for (DownloadRule r : candidates) {
-            if (r.responseIsJson) {
-                needsBody = true;
-                break;
-            }
-        }
-
-        ObservationResponseWrapper mirrored =
-                new ObservationResponseWrapper(httpResponse, needsBody, responseBufferMaxBytes);
+        ObservationResponse mirrored = new ObservationResponse(httpResponse);
 
         chain.doFilter(httpRequest, mirrored);
 
@@ -289,9 +289,6 @@ public final class DownloadTrackingFilter implements Filter {
         for (Map.Entry<String, String> e : verdict.extractedDimensions.entrySet()) {
             b.dimension(e.getKey(), e.getValue());
         }
-        for (Map.Entry<String, Double> e : verdict.extractedMetrics.entrySet()) {
-            b.metric(e.getKey(), e.getValue());
-        }
 
         ingest.enqueue(b.build());
         LOG.debug("[{}] dispatched download analytics ({})", PID, verdict.code);
@@ -317,7 +314,7 @@ public final class DownloadTrackingFilter implements Filter {
     }
 
     private static Match matchAny(List<DownloadRule> candidates, HttpServletRequest request,
-            ObservationResponseWrapper mirrored) {
+            ObservationResponse mirrored) {
         int status = mirrored.terminalStatus();
         for (DownloadRule rule : candidates) {
             if (!rule.statusMatches(status)) {
@@ -328,23 +325,7 @@ public final class DownloadTrackingFilter implements Filter {
                 continue;
             }
 
-            JsonNode root = null;
-            if (rule.responseIsJson) {
-                if (mirrored.bodyOverflowed()) {
-                    LOG.debug("[{}] rule {} skipped — response body exceeded buffer cap", PID, rule.name);
-                    continue;
-                }
-                root = parseCapturedJson(mirrored);
-                if (root == null || !root.isObject()) {
-                    continue;
-                }
-                if (!hasAllProps(root, rule.requiredJsonProps)) {
-                    continue;
-                }
-            }
-
             Map<String, String> dims = new LinkedHashMap<>();
-            Map<String, Double> metrics = new LinkedHashMap<>();
 
             if (rule.extractPathFromUrl) {
                 String resourcePath = stripSuffix(request.getRequestURI(), rule.urlSuffix);
@@ -368,54 +349,9 @@ public final class DownloadTrackingFilter implements Filter {
                 }
             }
 
-            if (root != null) {
-                for (Map.Entry<String, String> mapping : rule.jsonStringProps.entrySet()) {
-                    JsonNode node = root.get(mapping.getKey());
-                    if (node != null && node.isValueNode() && !node.isNull()) {
-                        dims.put(mapping.getValue(), trim(node.asText(""), 1024));
-                    }
-                }
-                for (Map.Entry<String, String> mapping : rule.jsonArrayProps.entrySet()) {
-                    JsonNode node = root.get(mapping.getKey());
-                    if (node != null && node.isArray()) {
-                        List<String> values = new ArrayList<>(node.size());
-                        for (JsonNode item : node) {
-                            if (item != null && item.isValueNode() && !item.isNull()) {
-                                values.add(item.asText(""));
-                            }
-                        }
-                        dims.put(mapping.getValue(), trim(toJsonStringArray(values), 8192));
-                        metrics.put(mapping.getValue() + "_count", (double) values.size());
-                    }
-                }
-            }
-
-            return Match.of(rule.name, rule.subtype, dims, metrics);
+            return Match.of(rule.name, rule.subtype, dims);
         }
         return Match.unmatched();
-    }
-
-    private static JsonNode parseCapturedJson(ObservationResponseWrapper mirrored) {
-        byte[] body = mirrored.capturedBody();
-        if (body == null || body.length == 0) {
-            return null;
-        }
-        try {
-            return MAPPER.readTree(body);
-        } catch (IOException ex) {
-            LOG.debug("[{}] response body is not valid JSON ({} bytes): {}", PID, body.length, ex.toString());
-            return null;
-        }
-    }
-
-    private static boolean hasAllProps(JsonNode root, List<String> props) {
-        for (String p : props) {
-            JsonNode n = root.get(p);
-            if (n == null || n.isNull()) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private static String stripSuffix(String uri, String suffix) {
@@ -449,80 +385,30 @@ public final class DownloadTrackingFilter implements Filter {
         return slash < 0 ? resourcePath : resourcePath.substring(slash + 1);
     }
 
-    private static String toJsonStringArray(List<String> values) {
-        StringBuilder sb = new StringBuilder(values.size() * 32);
-        sb.append('[');
-        for (int i = 0; i < values.size(); i++) {
-            if (i > 0) {
-                sb.append(',');
-            }
-            sb.append('"').append(escapeJson(values.get(i))).append('"');
-        }
-        sb.append(']');
-        return sb.toString();
-    }
-
-    private static String escapeJson(String value) {
-        if (value == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder(value.length() + 8);
-        for (int i = 0, n = value.length(); i < n; i++) {
-            char c = value.charAt(i);
-            switch (c) {
-                case '"':
-                    sb.append("\\\"");
-                    break;
-                case '\\':
-                    sb.append("\\\\");
-                    break;
-                case '\n':
-                    sb.append("\\n");
-                    break;
-                case '\r':
-                    sb.append("\\r");
-                    break;
-                case '\t':
-                    sb.append("\\t");
-                    break;
-                default:
-                    if (c < 0x20) {
-                        sb.append(String.format("\\u%04x", (int) c));
-                    } else {
-                        sb.append(c);
-                    }
-            }
-        }
-        return sb.toString();
-    }
-
-    /** Match outcome carrier including extracted dimensions/metrics. */
+    /** Match outcome carrier including extracted dimensions. */
     private static final class Match {
 
         private static final Match NO_MATCH =
-                new Match(false, "", "", Collections.emptyMap(), Collections.emptyMap());
+                new Match(false, "", "", Collections.emptyMap());
 
         final boolean success;
         final String code;
         final String subtype;
         final Map<String, String> extractedDimensions;
-        final Map<String, Double> extractedMetrics;
 
-        private Match(boolean success, String code, String subtype,
-                Map<String, String> dims, Map<String, Double> metrics) {
+        private Match(boolean success, String code, String subtype, Map<String, String> dims) {
             this.success = success;
             this.code = code;
             this.subtype = subtype;
             this.extractedDimensions = dims;
-            this.extractedMetrics = metrics;
         }
 
         static Match unmatched() {
             return NO_MATCH;
         }
 
-        static Match of(String code, String subtype, Map<String, String> dims, Map<String, Double> metrics) {
-            return new Match(true, code, subtype, dims, metrics);
+        static Match of(String code, String subtype, Map<String, String> dims) {
+            return new Match(true, code, subtype, dims);
         }
     }
 
@@ -535,14 +421,8 @@ public final class DownloadTrackingFilter implements Filter {
         final List<Integer> exactStatuses;
         final boolean redirectBand;
         final boolean anyStatus;
-        final boolean responseIsJson;
-        final List<String> requiredJsonProps;
         final boolean extractPathFromUrl;
-        /** jsonPropName -> dimensionName */
-        final Map<String, String> jsonStringProps;
-        /** jsonPropName -> dimensionName */
-        final Map<String, String> jsonArrayProps;
-        /** queryParamName -> dimensionName (used when the response body cannot or shouldn't be parsed) */
+        /** queryParamName -> dimensionName */
         final Map<String, String> queryParamDimensions;
         /** Query parameter names that must be present with a non-empty value for the rule to fire. */
         final List<String> requiredQueryParams;
@@ -551,9 +431,7 @@ public final class DownloadTrackingFilter implements Filter {
 
         DownloadRule(String name, String subtype, String urlSuffix, String method,
                 List<Integer> exactStatuses, boolean redirectBand, boolean anyStatus,
-                boolean responseIsJson, List<String> requiredJsonProps,
-                boolean extractPathFromUrl, Map<String, String> jsonStringProps,
-                Map<String, String> jsonArrayProps,
+                boolean extractPathFromUrl,
                 Map<String, String> queryParamDimensions, List<String> requiredQueryParams,
                 int priority) {
             this.name = name;
@@ -563,11 +441,7 @@ public final class DownloadTrackingFilter implements Filter {
             this.exactStatuses = exactStatuses;
             this.redirectBand = redirectBand;
             this.anyStatus = anyStatus;
-            this.responseIsJson = responseIsJson;
-            this.requiredJsonProps = requiredJsonProps;
             this.extractPathFromUrl = extractPathFromUrl;
-            this.jsonStringProps = jsonStringProps;
-            this.jsonArrayProps = jsonArrayProps;
             this.queryParamDimensions = queryParamDimensions;
             this.requiredQueryParams = requiredQueryParams;
             this.priority = priority;
@@ -605,6 +479,8 @@ public final class DownloadTrackingFilter implements Filter {
             kv.put(key, value);
         }
 
+        rejectBodyInspectionKeys(kv.keySet());
+
         String name = required(kv, "name");
         String subtype = required(kv, "subtype");
         String urlSuffix = required(kv, "url_suffix");
@@ -637,23 +513,9 @@ public final class DownloadTrackingFilter implements Filter {
             throw new IllegalArgumentException("status must specify at least one numeric code, 'redirect', or 'any'");
         }
 
-        boolean responseIsJson = parseBool(kv.get("response_is_json"), false);
-        List<String> requiredJsonProps = csv(kv.get("json_required_props"));
         boolean extractPathFromUrl = parseBool(kv.get("extract_path_from_url"), false);
-        Map<String, String> jsonStringProps = parseMappingPairs(kv.get("json_string_props"));
-        Map<String, String> jsonArrayProps = parseMappingPairs(kv.get("json_array_props"));
         Map<String, String> queryParamDimensions = parseMappingPairs(kv.get("query_param_dimensions"));
         List<String> requiredQueryParams = csv(kv.get("query_params_required"));
-
-        if (!requiredJsonProps.isEmpty() && !responseIsJson) {
-            throw new IllegalArgumentException("json_required_props requires response_is_json=true");
-        }
-        if (!jsonStringProps.isEmpty() && !responseIsJson) {
-            throw new IllegalArgumentException("json_string_props requires response_is_json=true");
-        }
-        if (!jsonArrayProps.isEmpty() && !responseIsJson) {
-            throw new IllegalArgumentException("json_array_props requires response_is_json=true");
-        }
 
         int priority = Integer.MAX_VALUE;
         String prio = kv.get("priority");
@@ -669,10 +531,7 @@ public final class DownloadTrackingFilter implements Filter {
 
         return new DownloadRule(name, subtype, urlSuffix, method,
                 Collections.unmodifiableList(exact), band, anyStatus,
-                responseIsJson, Collections.unmodifiableList(requiredJsonProps),
                 extractPathFromUrl,
-                Collections.unmodifiableMap(jsonStringProps),
-                Collections.unmodifiableMap(jsonArrayProps),
                 Collections.unmodifiableMap(queryParamDimensions),
                 Collections.unmodifiableList(requiredQueryParams),
                 priority);
@@ -706,7 +565,7 @@ public final class DownloadTrackingFilter implements Filter {
                 dim = t.substring(colon + 1).trim();
             }
             if (key.isEmpty() || dim.isEmpty()) {
-                throw new IllegalArgumentException("invalid mapping entry '" + t + "' (expected jsonProp:dimensionName)");
+                throw new IllegalArgumentException("invalid mapping entry '" + t + "' (expected paramName:dimensionName)");
             }
             out.put(key, dim);
         }
@@ -737,10 +596,29 @@ public final class DownloadTrackingFilter implements Filter {
 
     private static final Set<String> KNOWN_KEYS = new LinkedHashSet<>(Arrays.asList(
             "name", "subtype", "url_suffix", "method", "status",
-            "response_is_json", "json_required_props",
-            "extract_path_from_url", "json_string_props", "json_array_props",
+            "extract_path_from_url",
             "query_param_dimensions", "query_params_required",
             "priority"));
+
+    /**
+     * Response-body inspection keys are intentionally rejected: see the class JavaDoc for the
+     * AEMaaCS-download incident they caused. If an old configuration still contains any of these
+     * keys we want to fail fast rather than silently ignore them and leave the operator believing
+     * body inspection still works.
+     */
+    private static final Set<String> REJECTED_BODY_KEYS = new LinkedHashSet<>(Arrays.asList(
+            "response_is_json", "json_required_props", "json_string_props", "json_array_props"));
+
+    private static void rejectBodyInspectionKeys(Set<String> keys) {
+        for (String k : keys) {
+            if (REJECTED_BODY_KEYS.contains(k)) {
+                throw new IllegalArgumentException("response-body inspection key '" + k
+                        + "' is no longer supported — see DownloadTrackingFilter JavaDoc. "
+                        + "Use a follow-up GET rule (e.g. query_param_dimensions on "
+                        + ".downloadbinaries.json?downloadId=&artifactId=) to capture identifiers.");
+            }
+        }
+    }
 
     private static void validateKnownKeys(Set<String> keys) {
         for (String k : keys) {
@@ -751,37 +629,23 @@ public final class DownloadTrackingFilter implements Filter {
     }
 
     /**
-     * Wraps the response so the filter can: (a) observe terminal status,
-     * (b) optionally tee the body bytes into a capped buffer for JSON parsing.
-     * Body capture is disabled unless requested, so non-download requests pay zero overhead.
+     * Strictly non-invasive response wrapper. Mirrors the design of
+     * {@link AuthenticationTrackingFilter.ObservationResponse}: overrides only the methods that set
+     * the terminal HTTP status so we can observe it after the chain returns. Crucially this class
+     * does <strong>not</strong> override {@code getOutputStream()} or {@code getWriter()} and does
+     * not touch any response bytes — that is what makes it safe to sit in front of AEMaaCS's own
+     * asset-download handlers without breaking their streaming semantics.
      */
-    static final class ObservationResponseWrapper extends HttpServletResponseWrapper {
+    static final class ObservationResponse extends HttpServletResponseWrapper {
 
-        private final boolean captureBody;
-        private final int maxBytes;
-        private final ByteArrayOutputStream buffer;
-        private boolean overflowed;
         private int status = HttpServletResponse.SC_OK;
-        private TeeServletOutputStream cachedStream;
-        private PrintWriter cachedWriter;
 
-        ObservationResponseWrapper(HttpServletResponse delegate, boolean captureBody, int maxBytes) {
+        ObservationResponse(HttpServletResponse delegate) {
             super(delegate);
-            this.captureBody = captureBody;
-            this.maxBytes = maxBytes;
-            this.buffer = captureBody ? new ByteArrayOutputStream(Math.min(8192, maxBytes)) : null;
         }
 
         int terminalStatus() {
             return status;
-        }
-
-        boolean bodyOverflowed() {
-            return overflowed;
-        }
-
-        byte[] capturedBody() {
-            return buffer == null ? null : buffer.toByteArray();
         }
 
         @Override
@@ -817,129 +681,8 @@ public final class DownloadTrackingFilter implements Filter {
 
         @Override
         public void reset() {
-            if (buffer != null) {
-                buffer.reset();
-                overflowed = false;
-            }
             status = HttpServletResponse.SC_OK;
             super.reset();
-        }
-
-        @Override
-        public ServletOutputStream getOutputStream() throws IOException {
-            if (!captureBody) {
-                return super.getOutputStream();
-            }
-            if (cachedWriter != null) {
-                throw new IllegalStateException("getWriter() already called on response");
-            }
-            if (cachedStream == null) {
-                cachedStream = new TeeServletOutputStream(super.getOutputStream(), this);
-            }
-            return cachedStream;
-        }
-
-        @Override
-        public PrintWriter getWriter() throws IOException {
-            if (!captureBody) {
-                return super.getWriter();
-            }
-            if (cachedStream != null) {
-                throw new IllegalStateException("getOutputStream() already called on response");
-            }
-            if (cachedWriter == null) {
-                String enc = getCharacterEncoding();
-                if (enc == null || enc.isEmpty()) {
-                    enc = "UTF-8";
-                }
-                cachedStream = new TeeServletOutputStream(super.getOutputStream(), this);
-                cachedWriter = new PrintWriter(new OutputStreamWriter(cachedStream, enc), false);
-            }
-            return cachedWriter;
-        }
-
-        @Override
-        public void flushBuffer() throws IOException {
-            if (cachedWriter != null) {
-                cachedWriter.flush();
-            }
-            super.flushBuffer();
-        }
-
-        void recordBytes(byte[] b, int off, int len) {
-            if (buffer == null) {
-                return;
-            }
-            int remaining = maxBytes - buffer.size();
-            if (remaining <= 0) {
-                overflowed = true;
-                return;
-            }
-            int copy = Math.min(remaining, len);
-            buffer.write(b, off, copy);
-            if (copy < len) {
-                overflowed = true;
-            }
-        }
-
-        void recordByte(int b) {
-            if (buffer == null) {
-                return;
-            }
-            if (buffer.size() >= maxBytes) {
-                overflowed = true;
-                return;
-            }
-            buffer.write(b);
-        }
-    }
-
-    /** Tee'd output stream — every write is forwarded to the real client AND to the capped buffer. */
-    static final class TeeServletOutputStream extends ServletOutputStream {
-
-        private final ServletOutputStream delegate;
-        private final ObservationResponseWrapper owner;
-
-        TeeServletOutputStream(ServletOutputStream delegate, ObservationResponseWrapper owner) {
-            this.delegate = delegate;
-            this.owner = owner;
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            owner.recordByte(b);
-            delegate.write(b);
-        }
-
-        @Override
-        public void write(byte[] b) throws IOException {
-            write(b, 0, b.length);
-        }
-
-        @Override
-        public void write(byte[] b, int off, int len) throws IOException {
-            owner.recordBytes(b, off, len);
-            delegate.write(b, off, len);
-        }
-
-        @Override
-        public void flush() throws IOException {
-            delegate.flush();
-        }
-
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
-
-        @Override
-        public boolean isReady() {
-            return delegate.isReady();
-        }
-
-        @Override
-        public void setWriteListener(WriteListener writeListener) {
-            delegate.setWriteListener(writeListener);
         }
     }
 
