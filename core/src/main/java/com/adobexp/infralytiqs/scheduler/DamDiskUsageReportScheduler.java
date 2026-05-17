@@ -1,5 +1,6 @@
 package com.adobexp.infralytiqs.scheduler;
 
+import com.adobexp.infralytiqs.scheduler.internal.ReportsApiClient;
 import com.adobexp.infralytiqs.service.InfralytiqsAnalyticsPayload;
 import com.adobexp.infralytiqs.service.InfralytiqsService;
 import com.adobexp.log.Logger;
@@ -171,8 +172,12 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                 description = "Master kill switch. When false (default) the component activates "
                         + "but does NOT register a Sling Scheduler job — useful to deploy the "
                         + "code without it firing. Flip to true in the deployed cfg.json to "
-                        + "actually run the scan.")
-        boolean enable_scheduler() default false;
+                        + "actually run the scan. Method name is intentionally camelCase (not "
+                        + "enable_scheduler) so the OSGi property name stays 'enableScheduler' "
+                        + "and matches the cfg.json key verbatim — Felix metatype's underscore "
+                        + "rule would otherwise map enable_scheduler() to 'enable.scheduler' and "
+                        + "silently ignore a cfg.json key written as 'enable_scheduler'.")
+        boolean enableScheduler() default false;
 
         @AttributeDefinition(
                 name = "Cron expression",
@@ -235,6 +240,90 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         + "to the cron schedule. Useful during testing so you don't have to wait "
                         + "for the next cron tick. Default false.")
         boolean runOnActivate() default false;
+
+        // ─── Strategy selection ───────────────────────────────────────────────────────────
+
+        @AttributeDefinition(
+                name = "Report strategy mode",
+                description = "Which disk-usage strategy to run on every cron tick. "
+                        + "JCR_WALK = direct in-JVM JCR traversal (default, no auth, exact bytes). "
+                        + "REPORTS_API = AEM's four-step 'generatereport' API (creates job, polls, "
+                        + "downloads CSV, deletes; matches the Postman flow in the PDF). "
+                        + "BOTH = runs JCR_WALK then REPORTS_API in the same tick so the two "
+                        + "outputs can be compared in ClickHouse via the report_strategy dimension. "
+                        + "Every emitted event carries report_strategy=JCR_WALK or REPORTS_API.",
+                options = {
+                        @org.osgi.service.metatype.annotations.Option(label = "JCR_WALK (direct JCR traversal)", value = "JCR_WALK"),
+                        @org.osgi.service.metatype.annotations.Option(label = "REPORTS_API (4-step AEM Reports API)", value = "REPORTS_API"),
+                        @org.osgi.service.metatype.annotations.Option(label = "BOTH (A/B both strategies each tick)", value = "BOTH")
+                })
+        String mode() default "JCR_WALK";
+
+        // ─── Reports API (PDF four-step flow) — only consulted when mode != JCR_WALK ─────
+
+        @AttributeDefinition(
+                name = "Reports API: base URL",
+                description = "Loopback URL the AEM author JVM listens on, no trailing slash. "
+                        + "AEMaaCS author default is http://localhost:4502. Only consulted when "
+                        + "mode = REPORTS_API or BOTH.")
+        String reportsApiBaseUrl() default "http://localhost:4502";
+
+        @AttributeDefinition(
+                name = "Reports API: username",
+                description = "HTTP Basic auth username. Per the PDF (Section 5) the operations "
+                        + "team uses 'report-admin'. Defaults to that; override if your "
+                        + "environment uses a different account. Only consulted when "
+                        + "mode = REPORTS_API or BOTH.")
+        String reportsApiUsername() default "report-admin";
+
+        @AttributeDefinition(
+                name = "Reports API: password",
+                description = "HTTP Basic auth password. Per the PDF Section 5 'will be delivered "
+                        + "on request basis'. Empty by default — operator MUST supply via the "
+                        + "deployed cfg.json (or via OSGi Crypto Support). Only consulted when "
+                        + "mode = REPORTS_API or BOTH.",
+                type = org.osgi.service.metatype.annotations.AttributeType.PASSWORD)
+        String reportsApiPassword() default "";
+
+        @AttributeDefinition(
+                name = "Reports API: tenant DAM paths",
+                description = "One report job is created per entry. Mirrors the PDF Section 4 "
+                        + "tenant table — e.g. '/content/dam/ask-the-lion', '/content/dam/pxp', "
+                        + "'/content/dam/ps', '/content/dam/visa', '/content/dam/px', "
+                        + "'/content/dam/garnier', '/content/dam/dot'. Defaults to "
+                        + "['/content/dam'] for a single-job all-tenant report. Only consulted "
+                        + "when mode = REPORTS_API or BOTH.")
+        String[] reportsApiTenantPaths() default {"/content/dam"};
+
+        @AttributeDefinition(
+                name = "Reports API: poll interval (seconds)",
+                description = "Seconds between polls of /var/dam/reports/<jobNodeName>.json "
+                        + "during STEP 2. Default 5s (sweet spot for tenant roots up to ~100 k "
+                        + "assets).")
+        int reportsApiPollIntervalSec() default 5;
+
+        @AttributeDefinition(
+                name = "Reports API: poll timeout (seconds)",
+                description = "Total seconds to wait for jobStatus=completed before giving up. "
+                        + "Default 600 (10 min) handles tenant roots in the low-millions of "
+                        + "assets. Raise for very large roots; lower for fast-fail.")
+        int reportsApiPollTimeoutSec() default 600;
+    }
+
+    /** Strategy switch for {@link DamDiskUsageReportCfg#mode()}. */
+    enum Mode {
+        JCR_WALK, REPORTS_API, BOTH;
+
+        static Mode parseSafe(String raw, Mode fallback) {
+            if (raw == null) {
+                return fallback;
+            }
+            try {
+                return valueOf(raw.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException ex) {
+                return fallback;
+            }
+        }
     }
 
     @Reference
@@ -257,14 +346,14 @@ public final class DamDiskUsageReportScheduler implements Runnable {
     @Activate
     void activate(DamDiskUsageReportCfg c) {
         this.cfg = c;
-        LOG.info("[{}] activate — enable_scheduler={} cronExpression='{}' roots={} includeRenditions={} subService='{}' maxDepth={} maxFoldersPerRun={} runOnActivate={}",
-                PID, c.enable_scheduler(), c.cronExpression(),
+        LOG.info("[{}] activate — enableScheduler={} cronExpression='{}' roots={} includeRenditions={} subService='{}' maxDepth={} maxFoldersPerRun={} runOnActivate={}",
+                PID, c.enableScheduler(), c.cronExpression(),
                 Arrays.toString(c.reportRootPaths()), c.includeRenditions(), c.subService(),
                 c.maxDepth(), c.maxFoldersPerRun(), c.runOnActivate());
 
         applySchedule(c);
 
-        if (c.enable_scheduler() && c.runOnActivate()) {
+        if (c.enableScheduler() && c.runOnActivate()) {
             LOG.info("[{}] runOnActivate=true — kicking off an immediate one-shot run", PID);
             // Run synchronously on the activator thread. AEMaaCS treats the OSGi activator pool
             // as short-tasks-only, so we wrap in a daemon thread to avoid blocking the bundle
@@ -277,8 +366,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
     @Modified
     void modified(DamDiskUsageReportCfg c) {
-        LOG.info("[{}] modified — re-applying configuration (enable_scheduler={} cronExpression='{}')",
-                PID, c.enable_scheduler(), c.cronExpression());
+        LOG.info("[{}] modified — re-applying configuration (enableScheduler={} cronExpression='{}')",
+                PID, c.enableScheduler(), c.cronExpression());
         this.cfg = c;
         applySchedule(c);
     }
@@ -316,9 +405,9 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                     PID, SCHEDULER_JOB_NAME, ex.toString());
         }
 
-        if (!c.enable_scheduler()) {
-            LOG.warn("[{}] enable_scheduler=false — Sling Scheduler job NOT registered. Set "
-                    + "enable_scheduler=true in the deployed cfg.json to activate.", PID);
+        if (!c.enableScheduler()) {
+            LOG.warn("[{}] enableScheduler=false — Sling Scheduler job NOT registered. Set "
+                    + "enableScheduler=true in the deployed cfg.json to activate.", PID);
             return;
         }
 
@@ -362,53 +451,210 @@ public final class DamDiskUsageReportScheduler implements Runnable {
         String runId = UUID.randomUUID().toString();
         long startNanos = System.nanoTime();
         String startIso = Instant.now().toString();
+        Mode mode = Mode.parseSafe(live.mode(), Mode.JCR_WALK);
+
+        LOG.info("[{}] run STARTED — runId={} mode={} startIso={}", PID, runId, mode, startIso);
+
+        if (mode == Mode.JCR_WALK || mode == Mode.BOTH) {
+            runJcrWalkStrategy(live, runId, startIso);
+        }
+        if (mode == Mode.REPORTS_API || mode == Mode.BOTH) {
+            runReportsApiStrategy(live, runId, startIso);
+        }
+
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        LOG.info("[{}] run COMPLETE — runId={} mode={} elapsedMs={}", PID, runId, mode, elapsedMs);
+    }
+
+    /**
+     * Direct JCR-walk strategy. Reads every folder under every {@code reportRootPaths} entry via
+     * a service-user-backed {@link ResourceResolver}, computes exact byte sizes from each
+     * {@link Asset}'s {@link Rendition}s, and emits one {@code asset_disk_usage_report} row per
+     * folder tagged with {@code report_strategy=JCR_WALK}.
+     */
+    private void runJcrWalkStrategy(DamDiskUsageReportCfg live, String runId, String startIso) {
+        long stratNanos = System.nanoTime();
         AtomicLong foldersVisited = new AtomicLong();
         AtomicLong eventsEmitted = new AtomicLong();
 
-        LOG.info("[{}] run STARTED — runId={} roots={} startIso={} includeRenditions={}",
-                PID, runId, Arrays.toString(live.reportRootPaths()), startIso, live.includeRenditions());
+        LOG.info("[{}] JCR_WALK strategy STARTED — runId={} roots={} includeRenditions={} subService='{}'",
+                PID, runId, Arrays.toString(live.reportRootPaths()), live.includeRenditions(),
+                live.subService());
 
         Map<String, Object> authInfo = new HashMap<>();
         authInfo.put(ResourceResolverFactory.SUBSERVICE, live.subService());
 
         try (ResourceResolver resolver = resourceResolverFactory.getServiceResourceResolver(authInfo)) {
-            LOG.debug("[{}] obtained service resource resolver (userID={}) for subService='{}'",
+            LOG.debug("[{}] JCR_WALK obtained service resource resolver (userID={}) for subService='{}'",
                     PID, resolver.getUserID(), live.subService());
 
             for (String rootPath : live.reportRootPaths()) {
                 if (rootPath == null || rootPath.isEmpty() || !rootPath.startsWith("/")) {
-                    LOG.warn("[{}] skipping invalid report root path '{}'", PID, rootPath);
+                    LOG.warn("[{}] JCR_WALK skipping invalid report root path '{}'", PID, rootPath);
                     continue;
                 }
                 Resource root = resolver.getResource(rootPath);
                 if (root == null) {
-                    LOG.warn("[{}] root path not present in JCR (runId={}): {}", PID, runId, rootPath);
+                    LOG.warn("[{}] JCR_WALK root path not present in JCR (runId={}): {}",
+                            PID, runId, rootPath);
                     continue;
                 }
-                LOG.info("[{}] walking root='{}' (runId={})", PID, rootPath, runId);
+                LOG.info("[{}] JCR_WALK walking root='{}' (runId={})", PID, rootPath, runId);
                 FolderStats stats = walkRoot(root, live, runId, startIso, rootPath,
                         foldersVisited, eventsEmitted);
-                LOG.info("[{}] root='{}' DONE — bytes={} assets={} folders={} (runId={})",
+                LOG.info("[{}] JCR_WALK root='{}' DONE — bytes={} assets={} folders={} (runId={})",
                         PID, rootPath, stats.bytesCumulative + stats.bytesSelf,
                         stats.assetsCumulative + stats.assetsSelf,
                         stats.foldersCumulative, runId);
             }
         } catch (LoginException ex) {
             LOG.error(
-                    "[{}] could not obtain service resource resolver (runId={}, subService='{}'): {}. "
+                    "[{}] JCR_WALK could not obtain service resource resolver (runId={}, subService='{}'): {}. "
                             + "Verify that a 'aem-infralytiqs-integrator.core:{}=[<system-user>]' mapping exists "
                             + "in a ServiceUserMapperImpl.amended-* OSGi config and that the system user has "
                             + "jcr:read on every report root path.",
                     PID, runId, live.subService(), ex.toString(), live.subService(), ex);
             return;
         } catch (RuntimeException ex) {
-            LOG.error("[{}] run FAILED (runId={}): {}", PID, runId, ex.toString(), ex);
+            LOG.error("[{}] JCR_WALK FAILED (runId={}): {}", PID, runId, ex.toString(), ex);
             return;
         }
 
-        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-        LOG.info("[{}] run COMPLETE — runId={} foldersVisited={} eventsEmitted={} elapsedMs={}",
+        long elapsedMs = (System.nanoTime() - stratNanos) / 1_000_000L;
+        LOG.info("[{}] JCR_WALK strategy COMPLETE — runId={} foldersVisited={} eventsEmitted={} elapsedMs={}",
                 PID, runId, foldersVisited.get(), eventsEmitted.get(), elapsedMs);
+    }
+
+    /**
+     * AEM-Reports four-step API strategy. One report job is created per
+     * {@link DamDiskUsageReportCfg#reportsApiTenantPaths()} entry. Each parsed CSV row is
+     * emitted as one {@code asset_disk_usage_report} event tagged with
+     * {@code report_strategy=REPORTS_API}.
+     *
+     * <p>Note that the per-row schema differs from JCR_WALK: AEM-Reports reports flat-list
+     * folders (one row per folder under the tenant root) with pre-aggregated size + asset
+     * count, not the JCR-walk's separate self/cumulative tally. We map AEM's "SIZE" →
+     * {@code size_bytes_cumulative} and "ASSET COUNT" → {@code asset_count_cumulative} so the
+     * field names line up for ClickHouse cross-strategy reporting.
+     */
+    private void runReportsApiStrategy(DamDiskUsageReportCfg live, String runId, String startIso) {
+        long stratNanos = System.nanoTime();
+
+        if (live.reportsApiPassword() == null || live.reportsApiPassword().isEmpty()) {
+            LOG.error("[{}] REPORTS_API strategy SKIPPED — reportsApiPassword is empty. Set it "
+                    + "in the deployed cfg.json (use the OSGi PASSWORD type so it's masked in "
+                    + "the Felix console). runId={}", PID, runId);
+            return;
+        }
+
+        String[] tenants = live.reportsApiTenantPaths();
+        LOG.info("[{}] REPORTS_API strategy STARTED — runId={} baseUrl='{}' username='{}' tenants={} pollIntervalSec={} pollTimeoutSec={}",
+                PID, runId, live.reportsApiBaseUrl(), live.reportsApiUsername(),
+                Arrays.toString(tenants), live.reportsApiPollIntervalSec(),
+                live.reportsApiPollTimeoutSec());
+
+        ReportsApiClient client = new ReportsApiClient(
+                live.reportsApiBaseUrl(),
+                live.reportsApiUsername(),
+                live.reportsApiPassword(),
+                live.reportsApiPollIntervalSec(),
+                live.reportsApiPollTimeoutSec());
+
+        long totalEmitted = 0;
+        for (String tenant : tenants) {
+            try {
+                int emitted = client.runForTenant(tenant,
+                        (row, tenantRoot, jobTitle, jobNodeName, rId, sIso) ->
+                                emitReportsApiFolderEvent(row, tenantRoot, jobTitle, jobNodeName, rId, sIso),
+                        runId, startIso);
+                totalEmitted += emitted;
+                LOG.info("[{}] REPORTS_API tenant='{}' DONE — eventsEmitted={} runId={}",
+                        PID, tenant, emitted, runId);
+            } catch (RuntimeException ex) {
+                LOG.error("[{}] REPORTS_API tenant='{}' FAILED runId={}: {}",
+                        PID, tenant, runId, ex.toString(), ex);
+            }
+        }
+
+        long elapsedMs = (System.nanoTime() - stratNanos) / 1_000_000L;
+        LOG.info("[{}] REPORTS_API strategy COMPLETE — runId={} tenants={} totalEventsEmitted={} elapsedMs={}",
+                PID, runId, tenants.length, totalEmitted, elapsedMs);
+    }
+
+    /**
+     * Builds and enqueues one {@code asset_disk_usage_report} event from a parsed CSV row.
+     * Mirrors {@link #emitFolderEvent(Frame, String, String, String)} field-for-field so the
+     * two strategies are pivot-compatible in ClickHouse, with the {@code report_strategy}
+     * dimension being the only required disambiguator.
+     */
+    private void emitReportsApiFolderEvent(ReportsApiClient.ReportsApiRow row,
+            String tenantRootPath, String jobTitle, String jobNodeName, String runId,
+            String startIso) {
+        String path = row.path == null ? "" : row.path;
+        String name = row.name == null ? nameOf(path) : row.name;
+        String parent = parentOf(path);
+        // AEM-Reports CSV doesn't carry folder depth — derive it relative to the tenant root.
+        int depth = computeDepth(tenantRootPath, path);
+
+        InfralytiqsAnalyticsPayload.Builder b =
+                InfralytiqsAnalyticsPayload.builder("asset_disk_usage_report")
+                        .eventSubtype("dam_disk_usage_folder_snapshot")
+                        .lookupPath(path)
+                        .pageUrl(path)
+                        .dimension("folder_path", trim(path, 2048))
+                        .dimension("folder_name", trim(name, 512))
+                        .dimension("folder_parent_path", trim(parent, 2048))
+                        .dimension("folder_depth", Integer.toString(depth))
+                        .dimension("report_root_path", trim(tenantRootPath, 2048))
+                        .dimension("report_run_id", runId)
+                        .dimension("report_run_started_iso", startIso)
+                        .dimension("report_strategy", "REPORTS_API")
+                        .dimension("reports_api_job_title", trim(jobTitle, 256))
+                        .dimension("reports_api_job_node_name", trim(jobNodeName, 256))
+                        // AEM-Reports SIZE = cumulative (whole subtree). It doesn't break out self vs
+                        // cumulative, so we report the cumulative value into both fields so cross-
+                        // strategy queries don't get NULLs.
+                        .metric("size_bytes_cumulative", (double) row.sizeBytes)
+                        .metric("asset_count_cumulative", (double) row.assetCount)
+                        .metric("size_bytes_self", (double) row.sizeBytes)
+                        .metric("asset_count_self", (double) row.assetCount)
+                        .metric("folder_depth_metric", (double) depth);
+
+        ingestPipeline.enqueue(b.build());
+
+        LOG.info("[{}] REPORTS_API emit folder='{}' depth={} bytes={} assets={} runId={}",
+                PID, path, depth, row.sizeBytes, row.assetCount, runId);
+    }
+
+    /**
+     * Folder depth relative to {@code rootPath}. {@code /content/dam/foo} under
+     * {@code /content/dam} → 1; {@code /content/dam/foo/bar} → 2. Returns 0 when {@code path}
+     * equals {@code rootPath} or doesn't start with it.
+     */
+    static int computeDepth(String rootPath, String path) {
+        if (rootPath == null || path == null) {
+            return 0;
+        }
+        if (!path.startsWith(rootPath)) {
+            return 0;
+        }
+        if (path.equals(rootPath)) {
+            return 0;
+        }
+        String rest = path.substring(rootPath.length());
+        if (rest.startsWith("/")) {
+            rest = rest.substring(1);
+        }
+        if (rest.isEmpty()) {
+            return 0;
+        }
+        int count = 1;
+        for (int i = 0; i < rest.length(); i++) {
+            if (rest.charAt(i) == '/') {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
@@ -495,6 +741,7 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         .dimension("report_root_path", trim(rootPath, 2048))
                         .dimension("report_run_id", runId)
                         .dimension("report_run_started_iso", startIso)
+                        .dimension("report_strategy", "JCR_WALK")
                         .metric("size_bytes_cumulative", (double) bytesCumul)
                         .metric("asset_count_cumulative", (double) assetsCumul)
                         .metric("size_bytes_self", (double) s.bytesSelf)
@@ -503,7 +750,7 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         ingestPipeline.enqueue(b.build());
 
-        LOG.info("[{}] emit folder='{}' depth={} self[bytes={},assets={}] cumul[bytes={},assets={}] runId={}",
+        LOG.info("[{}] JCR_WALK emit folder='{}' depth={} self[bytes={},assets={}] cumul[bytes={},assets={}] runId={}",
                 PID, path, frame.depth, s.bytesSelf, s.assetsSelf, bytesCumul, assetsCumul, runId);
     }
 
@@ -604,8 +851,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
     /** Convenience for tests / Felix console. */
     static String describeConfig(DamDiskUsageReportCfg c) {
         return String.format(Locale.ROOT,
-                "enable_scheduler=%b, cronExpression='%s', roots=%s, includeRenditions=%b, subService='%s', maxDepth=%d, maxFoldersPerRun=%d, runOnActivate=%b",
-                c.enable_scheduler(), c.cronExpression(), Arrays.toString(c.reportRootPaths()),
+                "enableScheduler=%b, cronExpression='%s', roots=%s, includeRenditions=%b, subService='%s', maxDepth=%d, maxFoldersPerRun=%d, runOnActivate=%b",
+                c.enableScheduler(), c.cronExpression(), Arrays.toString(c.reportRootPaths()),
                 c.includeRenditions(), c.subService(), c.maxDepth(), c.maxFoldersPerRun(),
                 c.runOnActivate());
     }

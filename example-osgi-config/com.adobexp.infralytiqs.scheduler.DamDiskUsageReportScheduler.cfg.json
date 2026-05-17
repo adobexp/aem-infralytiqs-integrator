@@ -1,13 +1,25 @@
 {
   "marker": "infralytiqs-dam-disk-usage-scheduler-enabled",
-  "enable_scheduler": true,
+  "enableScheduler": true,
   "cronExpression": "0 0/1 * * * ?",
   "runOnActivate": true,
+
+  "mode": "BOTH",
+
   "reportRootPaths": [
     "/content/dam"
   ],
   "includeRenditions": true,
   "subService": "infralytiqs-dam-reporter",
   "maxDepth": 12,
-  "maxFoldersPerRun": 100000
+  "maxFoldersPerRun": 100000,
+
+  "reportsApiBaseUrl": "http://localhost:4502",
+  "reportsApiUsername": "report-admin",
+  "reportsApiPassword": "",
+  "reportsApiTenantPaths": [
+    "/content/dam"
+  ],
+  "reportsApiPollIntervalSec": 5,
+  "reportsApiPollTimeoutSec": 600
 }

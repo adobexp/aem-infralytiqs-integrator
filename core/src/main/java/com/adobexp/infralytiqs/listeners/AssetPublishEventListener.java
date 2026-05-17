@@ -15,6 +15,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.osgi.framework.Constants;
@@ -174,6 +175,13 @@ public final class AssetPublishEventListener implements EventHandler {
     /** Counts every event that was actually dispatched into InfralytiqsService.enqueue(). */
     private final AtomicLong totalAssetEventsDispatched = new AtomicLong();
 
+    /**
+     * Latch so {@link #logUnknownEventShape(Event, long)} only dumps the full event property
+     * shape ONCE per activation cycle. After the first miss we drop to DEBUG-only so an
+     * unexpected event topology can't fill Loki.
+     */
+    private final AtomicBoolean unknownShapeLogged = new AtomicBoolean(false);
+
     @ObjectClassDefinition(
             name = "Infralytiqs Asset Publish Event Listener",
             description = "Subscribes to com/day/cq/replication AND com/adobe/granite/replication "
@@ -267,6 +275,7 @@ public final class AssetPublishEventListener implements EventHandler {
         // "events seen since this config went live" number.
         this.totalEventsObserved.set(0L);
         this.totalAssetEventsDispatched.set(0L);
+        this.unknownShapeLogged.set(false);
 
         if (whitelistedPaths.isEmpty()) {
             LOG.warn("[{}] activated WITHOUT any valid whitelist entries — listener will record nothing. "
@@ -295,26 +304,34 @@ public final class AssetPublishEventListener implements EventHandler {
             LOG.debug("[{}] received OSGi event #{} on topic='{}'", PID, observedNo, osgiEvent.getTopic());
         }
 
-        // Step 1 — unpack into a typed ReplicationEvent. Works for either of the two topics we
-        // subscribe to; the underlying constructor pulls "type", "paths", "userId" etc from the
-        // event properties regardless of topic name.
-        ReplicationEvent replicationEvent;
-        try {
-            replicationEvent = ReplicationEvent.fromEvent(osgiEvent);
-        } catch (Exception ex) {
-            LOG.debug("[{}] event #{} topic='{}' is not a ReplicationEvent: {} (dropping)",
-                    PID, observedNo, osgiEvent.getTopic(), ex.toString());
-            return;
+        // Step 1 — extract the ReplicationAction from the event.
+        //
+        // IMPORTANT: we do NOT use ReplicationEvent.fromEvent(osgiEvent) here even though that
+        // looks like the obvious tool for the job. fromEvent() is hard-coded to only accept
+        // events whose topic equals the compile-time ReplicationEvent.EVENT_TOPIC constant
+        // (which in this SDK resolves to com/adobe/granite/replication). On AEMaaCS production,
+        // the OSGi events that actually fire on author when a user clicks "Publish" use the
+        // legacy topic com/day/cq/replication — fromEvent() rejects those and silently returns
+        // null. That's exactly what we observed in Loki: 12 events received on
+        // com/day/cq/replication, all dropped with "returned null from ReplicationEvent.fromEvent".
+        //
+        // The underlying event STILL carries the typed ReplicationAction in its "action"
+        // property regardless of topic — this is the de-facto Day CQ contract (the constant
+        // ReplicationEvent.PROPERTY_ACTION isn't exposed in every SDK build, so we hard-code
+        // the literal). Reading the property directly works for both topics and is
+        // forward-compatible.
+        Object actionProp = osgiEvent.getProperty("action");
+        ReplicationAction action;
+        if (actionProp instanceof ReplicationAction) {
+            action = (ReplicationAction) actionProp;
+        } else {
+            // Defensive: if the event has no "action" property, dump the property keys ONCE at
+            // INFO level so we can see the actual event shape in Loki and adapt. After the
+            // first miss the rate-limit silences the dump to avoid log spam.
+            action = null;
+            logUnknownEventShape(osgiEvent, observedNo);
         }
-        if (replicationEvent == null) {
-            LOG.debug("[{}] event #{} topic='{}' returned null from ReplicationEvent.fromEvent (dropping)",
-                    PID, observedNo, osgiEvent.getTopic());
-            return;
-        }
-
-        ReplicationAction action = replicationEvent.getReplicationAction();
         if (action == null) {
-            LOG.debug("[{}] event #{} has no ReplicationAction (dropping)", PID, observedNo);
             return;
         }
 
@@ -440,6 +457,32 @@ public final class AssetPublishEventListener implements EventHandler {
             LOG.info("[{}] event #{} {} replication for {} path(s) had no whitelist match — 0 rows dispatched "
                     + "(filtered={}, batchId={}, user='{}', whitelist={})",
                     PID, observedNo, type.getName(), rawPaths.length, filtered, batchId, userId, whitelistedPaths);
+        }
+    }
+
+    /**
+     * One-shot diagnostic: when the event arrives without an "action" property we can't make
+     * progress, but we should at least log the property keys + topic so the operator can see
+     * the actual event shape in Loki. Guarded by {@link #unknownShapeLogged} so we don't spam
+     * the log if every event happens to be in an unexpected shape.
+     */
+    private void logUnknownEventShape(Event osgiEvent, long observedNo) {
+        if (unknownShapeLogged.compareAndSet(false, true)) {
+            String[] keys = osgiEvent.getPropertyNames();
+            StringBuilder summary = new StringBuilder();
+            if (keys != null) {
+                for (String k : keys) {
+                    Object v = osgiEvent.getProperty(k);
+                    String cls = v == null ? "null" : v.getClass().getName();
+                    summary.append(k).append('=').append(cls).append("; ");
+                }
+            }
+            LOG.warn("[{}] event #{} topic='{}' has no ReplicationAction in its 'action' property — "
+                    + "dropping. Event property shape (logged ONCE so we can adapt the parser): {}",
+                    PID, observedNo, osgiEvent.getTopic(), summary.toString());
+        } else if (LOG.isDebugEnabled()) {
+            LOG.debug("[{}] event #{} topic='{}' has no ReplicationAction — dropping (shape already logged)",
+                    PID, observedNo, osgiEvent.getTopic());
         }
     }
 
