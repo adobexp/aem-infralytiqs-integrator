@@ -1,0 +1,5 @@
+{
+  "user.mapping": [
+    "aem-infralytiqs-integrator.core:infralytiqs-dam-reporter=[infralytiqs-dam-reporter]"
+  ]
+}
