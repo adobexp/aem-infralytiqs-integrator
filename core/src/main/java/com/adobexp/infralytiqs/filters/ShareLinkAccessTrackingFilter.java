@@ -48,14 +48,14 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  *
  * <h2>Why this filter exists — and why this strategy was chosen</h2>
  *
- * <p>The natural place to track share creation is the
+ * <p>The natural place to track share creation would be the
  * {@code POST /adobe/repository/;api=operations;t={tenant}} endpoint of the Adobe Cloud Resource
- * Hierarchy (CRH) API, which is what {@link ShareAssetTrackingFilter} targets. On AEMaaCS that
- * endpoint is owned by Adobe-managed bundles (the {@code com.adobe.granite.assetmanagement.crh.*}
- * family) and the matrix-parameter URL shape (e.g. {@code ;api=operations;t=1778}) is a strong
- * signal it does not traverse the same Felix HTTP Whiteboard servlet path that the rest of AEM
- * does — empirically {@link ShareAssetTrackingFilter}'s {@code doFilter} was never invoked for
- * those URLs even with a wildcard context selector.
+ * Hierarchy (CRH) API. On AEMaaCS that endpoint is owned by Adobe-managed bundles (the
+ * {@code com.adobe.granite.assetmanagement.crh.*} family) and the matrix-parameter URL shape
+ * (e.g. {@code ;api=operations;t=1778}) is a strong signal it does not traverse the same Felix
+ * HTTP Whiteboard servlet path that the rest of AEM does — empirically an earlier filter targeting
+ * those URLs was never invoked even with a wildcard context selector, so that approach was
+ * abandoned in favour of this {@code /linkshare.html} strategy.
  *
  * <p>By contrast {@code /linkshare.html} is a vanilla Sling-rendered HTML page (the markers in
  * the response body, e.g. {@code /libs/dam/gui/content/adhocassetsharepage}, confirm a normal
@@ -135,8 +135,8 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  *   <li>The response wrapper is status-only by default. Body inspection requires an explicit
  *       opt-in flag on a matching rule.</li>
  *   <li>It removes one entire class of "filter never fires because the endpoint runs in a
- *       different named context" debugging step — exactly the failure mode that frustrated the
- *       diagnosis of {@link ShareAssetTrackingFilter} on the CRH endpoint.</li>
+ *       different named context" debugging step — exactly the failure mode that made tracking the
+ *       CRH {@code POST /adobe/repository} endpoint impossible from the OSGi HTTP Whiteboard.</li>
  * </ul>
  *
  * <p>This component is declared with {@link ConfigurationPolicy#REQUIRE} and {@link #PID}.
@@ -158,11 +158,11 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
                 // Bind to EVERY named whiteboard context. /linkshare.html is a Sling page so the
                 // narrower (name=org.apache.sling) selector that DownloadTrackingFilter uses would
                 // also work; we go wider on purpose to eliminate "wrong context" as a failure mode
-                // (which is what burned ShareAssetTrackingFilter on the CRH endpoint). See JavaDoc.
+                // (which is what blocked tracking the CRH POST /adobe/repository endpoint). See JavaDoc.
                 "osgi.http.whiteboard.context.select=(osgi.http.whiteboard.context.name=*)",
-                // Sit just behind ShareAssetTrackingFilter (8000); all four observe-only filters
-                // (Auth=10000, Download=9000, Share=8000, ShareLinkAccess=7000) cluster at the
-                // tail of the chain so the request user is already resolved when we record.
+                // Cluster at the tail of the chain with the other observe-only filters
+                // (Auth=10000, Download=9000, ShareLinkAccess=7000) so the request user is
+                // already resolved by the upstream auth handler by the time we record.
                 "service.ranking:Integer=7000"
         })
 @Designate(ocd = ShareLinkAccessTrackingFilter.ShareLinkAccessFilterCfg.class)
@@ -223,8 +223,8 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
         String[] patterns() default {
                 // Default rule: every successful render of /linkshare.html?sh=<token>. The 'sh'
                 // query param IS the opaque share token AEM hands recipients — recording its value
-                // is sufficient to correlate this view event with the matching creation event
-                // captured by ShareAssetTrackingFilter (or a future server-side share-store lookup).
+                // is sufficient to correlate this view event with the server-side share record
+                // (the same token would be used to look up the share's creator and creation time).
                 // 'inspect_response_body=true' opts this rule into Phase 2 HTML body extraction
                 // so the emitted event also carries 'share_paths' (csv of shared asset paths) and
                 // 'share_asset_count'. See the class JavaDoc for the safety+performance contract.
@@ -760,8 +760,7 @@ public final class ShareLinkAccessTrackingFilter implements Filter {
 
     /**
      * Status-only response wrapper — same contract as
-     * {@link DownloadTrackingFilter.ObservationResponse} and
-     * {@link ShareAssetTrackingFilter.ObservationResponse}: overrides only the methods that record
+     * {@link DownloadTrackingFilter.ObservationResponse}: overrides only the methods that record
      * the terminal HTTP status. {@code getOutputStream()} / {@code getWriter()} are NOT overridden
      * so the response payload remains entirely owned by AEMaaCS.
      */

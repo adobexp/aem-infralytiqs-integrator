@@ -1,0 +1,12 @@
+{
+  "marker": "infralytiqs-dam-disk-usage-scheduler-enabled",
+  "scheduler.expression": "",
+  "scheduler.period": 60,
+  "reportRootPaths": [
+    "/content/dam"
+  ],
+  "includeRenditions": true,
+  "subService": "infralytiqs-dam-reporter",
+  "maxDepth": 12,
+  "maxFoldersPerRun": 100000
+}

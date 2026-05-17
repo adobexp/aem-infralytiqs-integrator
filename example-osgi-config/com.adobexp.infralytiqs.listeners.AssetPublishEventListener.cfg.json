@@ -1,0 +1,9 @@
+{
+  "marker": "infralytiqs-asset-publish-tracking-enabled",
+  "whitelistedPaths": [
+    "/content/dam"
+  ],
+  "trackActivate": true,
+  "trackDeactivate": true,
+  "maxPathsPerReplication": 1000
+}

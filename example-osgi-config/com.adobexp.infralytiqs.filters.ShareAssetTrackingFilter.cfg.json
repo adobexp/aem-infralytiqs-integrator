@@ -1,7 +1,0 @@
-{
-  "marker": "infralytiqs-share-asset-tracking-enabled",
-  "requestBufferMaxBytes": 65536,
-  "patterns": [
-    "name=pattern_1_share_by_op;subtype=share_link_create_status_2xx;method=POST;status=200,201;request_content_type_contains=asset-operation+json;request_body_op=share;priority=1"
-  ]
-}
