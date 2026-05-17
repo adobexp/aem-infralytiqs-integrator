@@ -15,6 +15,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.osgi.framework.Constants;
 import org.osgi.service.component.annotations.Activate;
@@ -56,19 +57,38 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  * asset-path)} tuple. The {@code replication_batch_id} dimension is shared by every row of the
  * same replication so the original grouping is recoverable when needed.
  *
+ * <h2>Multi-topic subscription — why we hedge across two replication topics</h2>
+ *
+ * <p>On modern AEMaaCS, replication events surface on <em>two</em> different OSGi event topics
+ * depending on the path that triggered them:
+ * <ul>
+ *   <li>{@code com/day/cq/replication} — the historical Day CQ topic emitted directly by the
+ *       legacy {@code /bin/replicate} servlet path. The
+ *       {@code ReplicationEvent.EVENT_TOPIC} constant in some SDK versions resolves to this.</li>
+ *   <li>{@code com/adobe/granite/replication} — emitted by
+ *       {@code DistributionToReplicationEventEnabler} when a Sling Distribution agent finishes a
+ *       package (the path that AEMaaCS's modern "Publish" Touch-UI uses). On the SDK shipping
+ *       with this bundle, {@code ReplicationEvent.EVENT_TOPIC} resolves to this value.</li>
+ * </ul>
+ *
+ * <p>Binding only to {@code ReplicationEvent.EVENT_TOPIC} would have us subscribed to whichever
+ * one the compile-time SDK happens to choose — and silently miss the other one. We therefore
+ * explicitly subscribe to <em>both</em> topics via two
+ * {@link EventConstants#EVENT_TOPIC event.topics} component-property entries. The handler is
+ * topic-agnostic — {@link ReplicationEvent#fromEvent(Event)} unpacks either topic shape.
+ *
  * <h2>Configuration policy + runmode placement</h2>
  *
  * <p>The component is declared {@link ConfigurationPolicy#REQUIRE}, so Declarative Services does
- * not register this {@link EventHandler} (and the filter does not subscribe to the
- * {@link ReplicationEvent#EVENT_TOPIC} topic) until Configuration Admin sees a matching PID.
+ * not register this {@link EventHandler} until Configuration Admin sees a matching PID.
  * Operators control rollout by deploying — or not deploying — the
  * {@code com.adobexp.infralytiqs.listeners.AssetPublishEventListener.cfg.json} file.
  *
  * <p>The deployment cfg.json lives under {@code .../osgiconfig/config.author/} on purpose.
  * {@link ReplicationEvent} fires on BOTH author (when a user initiates a replication via
- * {@code /bin/replicate}) and on each publish instance (when the publish receives the
- * replicated payload). The same activation would therefore be recorded twice — once on each
- * tier — if the config were installed in plain {@code config/}. By binding to the
+ * {@code /bin/replicate} or the Publish action) and on each publish instance (when the publish
+ * receives the replicated payload). The same activation would therefore be recorded twice — once
+ * on each tier — if the config were installed in plain {@code config/}. By binding to the
  * {@code author} runmode we capture exactly the user-initiated event with the genuine
  * {@link ReplicationAction#getUserId()}, which is the row we want for "who published what".
  *
@@ -81,6 +101,27 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  *
  * <p>The default is {@code "/content/dam"} which covers all DAM assets. Operators can narrow to
  * a specific tenant subtree (e.g. {@code /content/dam/testdownload}) to limit ingestion volume.
+ *
+ * <h2>Loki observability</h2>
+ *
+ * <p>The deployed {@code LogbackLokiBootstrap} forwards {@code com.adobexp:DEBUG} so every log
+ * call below reaches Loki. The listener emits at least one log line for every OSGi event it
+ * receives (regardless of whether it passes filtering) — that way an operator searching Loki for
+ * {@code AssetPublishEventListener} can immediately tell <em>"is the listener alive but
+ * filtering everything out?"</em> apart from <em>"is the listener not receiving any events at
+ * all?"</em>.
+ *
+ * <ul>
+ *   <li>INFO on activate / modified — config snapshot with whitelist + gate flags.</li>
+ *   <li>INFO on every replication dispatched ({@code "dispatched N events"} per replication).</li>
+ *   <li>DEBUG on every entry into {@link #handleEvent(Event)} — topic, replication type,
+ *       user id, paths count — even when filtered. Sample rate is 1:1 because OSGi event
+ *       dispatch only fires on real replications, so volume is bounded by the actual
+ *       publish-button-click rate.</li>
+ *   <li>DEBUG with explicit rejection reason on every gate that drops the event (not a
+ *       ReplicationEvent / wrong action type / track*=false / no paths / no whitelist match /
+ *       ingest pipeline not bound).</li>
+ * </ul>
  *
  * <h2>What we deliberately do NOT do</h2>
  *
@@ -104,7 +145,16 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
         configurationPolicy = ConfigurationPolicy.REQUIRE,
         property = {
                 Constants.SERVICE_DESCRIPTION + "=Infralytiqs | Asset Publish Event Listener",
-                EventConstants.EVENT_TOPIC + "=" + ReplicationEvent.EVENT_TOPIC
+                // Subscribe to BOTH replication topics as string literals — see class Javadoc
+                // "Multi-topic subscription" section for why we don't trust
+                // ReplicationEvent.EVENT_TOPIC alone (it resolves to whichever single value the
+                // compile-time SDK picked). Order is irrelevant; EventAdmin dispatches
+                // independently per topic. We deliberately do NOT use
+                // ReplicationEvent.EVENT_TOPIC here because on the SDK shipping with this bundle
+                // it resolves to com/adobe/granite/replication, which would create a duplicate
+                // topic subscription and double-dispatch every modern replication event.
+                EventConstants.EVENT_TOPIC + "=com/day/cq/replication",
+                EventConstants.EVENT_TOPIC + "=com/adobe/granite/replication"
         })
 @Designate(ocd = AssetPublishEventListener.AssetPublishCfg.class)
 public final class AssetPublishEventListener implements EventHandler {
@@ -113,12 +163,25 @@ public final class AssetPublishEventListener implements EventHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger(AssetPublishEventListener.class);
 
+    /**
+     * Counts every OSGi event delivered to {@link #handleEvent(Event)} since the last activate.
+     * Surfaced in the INFO log of every successful dispatch so an operator scanning Loki sees
+     * how many events the listener has seen across its uptime, useful for distinguishing "never
+     * called" from "called and dropped".
+     */
+    private final AtomicLong totalEventsObserved = new AtomicLong();
+
+    /** Counts every event that was actually dispatched into InfralytiqsService.enqueue(). */
+    private final AtomicLong totalAssetEventsDispatched = new AtomicLong();
+
     @ObjectClassDefinition(
             name = "Infralytiqs Asset Publish Event Listener",
-            description = "Subscribes to com/day/cq/replication events and ships one Infralytiqs "
-                    + "analytics row per asset path per replication action. Deploy the OSGi config "
-                    + "under /apps/.../osgiconfig/config.author/ so it only runs on AEMaaCS author "
-                    + "(replication events also fire on publish on receipt, which would double-count).")
+            description = "Subscribes to com/day/cq/replication AND com/adobe/granite/replication "
+                    + "events and ships one Infralytiqs analytics row per asset path per "
+                    + "replication action. Deploy the OSGi config under "
+                    + "/apps/.../osgiconfig/config.author/ so it only runs on AEMaaCS author "
+                    + "(replication events also fire on publish on receipt, which would "
+                    + "double-count).")
     public @interface AssetPublishCfg {
 
         @AttributeDefinition(
@@ -154,6 +217,15 @@ public final class AssetPublishEventListener implements EventHandler {
                         + "tree-publish that targets thousands of assets in one go. Default 1000 "
                         + "matches the ingest service's per-batch ceiling.")
         int maxPathsPerReplication() default 1000;
+
+        @AttributeDefinition(
+                name = "Verbose entry logging",
+                description = "When true (default), the listener logs an INFO line on EVERY event "
+                        + "delivered to handleEvent — even when filtering drops it. Loud, but "
+                        + "invaluable during initial rollout because it proves the listener is "
+                        + "wired up regardless of whether the event survives the whitelist gate. "
+                        + "Set to false once the listener is known-good to reduce log volume.")
+        boolean verboseEntryLogging() default true;
     }
 
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
@@ -163,6 +235,7 @@ public final class AssetPublishEventListener implements EventHandler {
     private volatile boolean trackActivate = true;
     private volatile boolean trackDeactivate = true;
     private volatile int maxPathsPerReplication = 1000;
+    private volatile boolean verboseEntryLogging = true;
 
     @Activate
     @Modified
@@ -189,39 +262,65 @@ public final class AssetPublishEventListener implements EventHandler {
         this.trackActivate = cfg.trackActivate();
         this.trackDeactivate = cfg.trackDeactivate();
         this.maxPathsPerReplication = Math.max(1, cfg.maxPathsPerReplication());
+        this.verboseEntryLogging = cfg.verboseEntryLogging();
+        // Reset diagnostics counters on activate/modify so the next log line gives a clean
+        // "events seen since this config went live" number.
+        this.totalEventsObserved.set(0L);
+        this.totalAssetEventsDispatched.set(0L);
 
         if (whitelistedPaths.isEmpty()) {
-            LOG.warn("[{}] no whitelisted paths configured — listener will record nothing", PID);
+            LOG.warn("[{}] activated WITHOUT any valid whitelist entries — listener will record nothing. "
+                    + "Add at least one path under whitelistedPaths in the cfg.json.", PID);
         } else {
             LOG.info(
-                    "[{}] activated; whitelistedPaths={}, trackActivate={}, trackDeactivate={}, maxPathsPerReplication={}",
-                    PID, whitelistedPaths, trackActivate, trackDeactivate, maxPathsPerReplication);
+                    "[{}] activated — subscribed to topics [com/day/cq/replication, com/adobe/granite/replication]; "
+                            + "whitelistedPaths={}, trackActivate={}, trackDeactivate={}, "
+                            + "maxPathsPerReplication={}, verboseEntryLogging={}",
+                    PID, whitelistedPaths, trackActivate, trackDeactivate,
+                    maxPathsPerReplication, verboseEntryLogging);
         }
     }
 
     @Override
     public void handleEvent(Event osgiEvent) {
-        // ReplicationEvent.fromEvent unpacks the OSGi event into a typed wrapper. Returns null
-        // for events on the topic that are not actually replication events (unlikely on the
-        // dedicated com/day/cq/replication topic but defensive).
+        long observedNo = totalEventsObserved.incrementAndGet();
+
+        // Step 0 — "I am alive" entry log. Loud on purpose so that operators searching Loki for
+        // "AssetPublishEventListener" can immediately confirm the listener IS receiving events.
+        // The gating decisions logged below then explain what happened to each one.
+        if (verboseEntryLogging) {
+            LOG.info("[{}] received OSGi event #{} on topic='{}' (observedSinceActivate={}, dispatchedSinceActivate={})",
+                    PID, observedNo, osgiEvent.getTopic(), observedNo, totalAssetEventsDispatched.get());
+        } else if (LOG.isDebugEnabled()) {
+            LOG.debug("[{}] received OSGi event #{} on topic='{}'", PID, observedNo, osgiEvent.getTopic());
+        }
+
+        // Step 1 — unpack into a typed ReplicationEvent. Works for either of the two topics we
+        // subscribe to; the underlying constructor pulls "type", "paths", "userId" etc from the
+        // event properties regardless of topic name.
         ReplicationEvent replicationEvent;
         try {
             replicationEvent = ReplicationEvent.fromEvent(osgiEvent);
         } catch (Exception ex) {
-            LOG.debug("[{}] not a ReplicationEvent (topic={}): {}", PID, osgiEvent.getTopic(), ex.toString());
+            LOG.debug("[{}] event #{} topic='{}' is not a ReplicationEvent: {} (dropping)",
+                    PID, observedNo, osgiEvent.getTopic(), ex.toString());
             return;
         }
         if (replicationEvent == null) {
+            LOG.debug("[{}] event #{} topic='{}' returned null from ReplicationEvent.fromEvent (dropping)",
+                    PID, observedNo, osgiEvent.getTopic());
             return;
         }
 
         ReplicationAction action = replicationEvent.getReplicationAction();
         if (action == null) {
+            LOG.debug("[{}] event #{} has no ReplicationAction (dropping)", PID, observedNo);
             return;
         }
 
         ReplicationActionType type = action.getType();
         if (type == null) {
+            LOG.debug("[{}] event #{} has no ReplicationActionType (dropping)", PID, observedNo);
             return;
         }
 
@@ -230,24 +329,31 @@ public final class AssetPublishEventListener implements EventHandler {
         if (!isActivate && !isDeactivate) {
             // We deliberately ignore TEST, DELETE, INTERNAL_POLL, etc. — those are not user-facing
             // "publish/unpublish" actions and would pollute the report.
+            LOG.debug("[{}] event #{} type='{}' is neither ACTIVATE nor DEACTIVATE (dropping)",
+                    PID, observedNo, type.getName());
             return;
         }
         if (isActivate && !trackActivate) {
+            LOG.debug("[{}] event #{} ACTIVATE dropped — trackActivate=false", PID, observedNo);
             return;
         }
         if (isDeactivate && !trackDeactivate) {
+            LOG.debug("[{}] event #{} DEACTIVATE dropped — trackDeactivate=false", PID, observedNo);
             return;
         }
 
         String[] rawPaths = action.getPaths();
         if (rawPaths == null || rawPaths.length == 0) {
+            LOG.debug("[{}] event #{} type='{}' carries no paths (dropping)",
+                    PID, observedNo, type.getName());
             return;
         }
 
         InfralytiqsService ingest = ingestPipeline;
         if (ingest == null) {
-            LOG.warn("[{}] {} replication for {} path(s) ignored — ingest pipeline not bound",
-                    PID, type.getName(), rawPaths.length);
+            LOG.warn("[{}] event #{} {} replication for {} path(s) ignored — InfralytiqsService not bound. "
+                    + "Check that com.adobexp.infralytiqs.service.impl.InfralytiqsServiceImpl is active.",
+                    PID, observedNo, type.getName(), rawPaths.length);
             return;
         }
 
@@ -265,12 +371,17 @@ public final class AssetPublishEventListener implements EventHandler {
         // correlation without depending on the action object surviving past handleEvent.
         String batchId = correlationId(userId, timeMs, rawPaths[0]);
 
+        if (verboseEntryLogging) {
+            LOG.info("[{}] event #{} parsed — type='{}' user='{}' timeIso='{}' pathsCount={} batchId={} firstPath='{}'",
+                    PID, observedNo, type.getName(), userId, timeIso, rawPaths.length, batchId, rawPaths[0]);
+        }
+
         int emitted = 0;
         int filtered = 0;
         for (String path : rawPaths) {
             if (emitted >= maxPathsPerReplication) {
-                LOG.warn("[{}] replication {} truncated at {} of {} paths (maxPathsPerReplication cap)",
-                        PID, batchId, emitted, rawPaths.length);
+                LOG.warn("[{}] event #{} replication {} truncated at {} of {} paths (maxPathsPerReplication cap)",
+                        PID, observedNo, batchId, emitted, rawPaths.length);
                 break;
             }
             if (path == null || path.isEmpty()) {
@@ -278,6 +389,8 @@ public final class AssetPublishEventListener implements EventHandler {
             }
             if (!matchesWhitelist(path, whitelistedPaths)) {
                 filtered++;
+                LOG.debug("[{}] event #{} path '{}' did not match whitelist {} — skipping",
+                        PID, observedNo, path, whitelistedPaths);
                 continue;
             }
 
@@ -307,20 +420,26 @@ public final class AssetPublishEventListener implements EventHandler {
                             .dimension("replication_action", type.getName())
                             .dimension("replication_batch_id", batchId)
                             .dimension("publish_event_time_iso", timeIso)
+                            .dimension("source_topic", osgiEvent.getTopic())
                             .metric("publish_event_time_ms", (double) timeMs)
                             .metric("asset_publish_count", isActivate ? 1.0 : 0.0)
                             .metric("asset_unpublish_count", isDeactivate ? 1.0 : 0.0);
 
             ingest.enqueue(b.build());
             emitted++;
+            LOG.debug("[{}] event #{} ENQUEUED asset='{}' subtype='{}' batchId={}",
+                    PID, observedNo, path, isActivate ? "publish" : "unpublish", batchId);
         }
 
+        long lifetimeDispatched = totalAssetEventsDispatched.addAndGet(emitted);
+
         if (emitted > 0) {
-            LOG.info("[{}] dispatched {} {} event(s) (filtered {}, batchId={}, user={})",
-                    PID, emitted, type.getName(), filtered, batchId, userId);
-        } else if (LOG.isDebugEnabled()) {
-            LOG.debug("[{}] {} replication for {} path(s) had no whitelist match (batchId={}, user={})",
-                    PID, type.getName(), rawPaths.length, batchId, userId);
+            LOG.info("[{}] event #{} dispatched {} {} row(s) (filtered {}, batchId={}, user='{}'); lifetimeDispatched={}",
+                    PID, observedNo, emitted, type.getName(), filtered, batchId, userId, lifetimeDispatched);
+        } else {
+            LOG.info("[{}] event #{} {} replication for {} path(s) had no whitelist match — 0 rows dispatched "
+                    + "(filtered={}, batchId={}, user='{}', whitelist={})",
+                    PID, observedNo, type.getName(), rawPaths.length, filtered, batchId, userId, whitelistedPaths);
         }
     }
 

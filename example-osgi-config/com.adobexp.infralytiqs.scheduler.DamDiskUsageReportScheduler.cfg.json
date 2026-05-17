@@ -1,7 +1,8 @@
 {
   "marker": "infralytiqs-dam-disk-usage-scheduler-enabled",
-  "scheduler.expression": "",
-  "scheduler.period": 60,
+  "enable_scheduler": true,
+  "cronExpression": "0 0/1 * * * ?",
+  "runOnActivate": true,
   "reportRootPaths": [
     "/content/dam"
   ],
