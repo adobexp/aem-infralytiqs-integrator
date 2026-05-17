@@ -181,17 +181,17 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         @AttributeDefinition(
                 name = "Cron expression",
-                description = "Quartz-style cron. Examples: '0 0/1 * * * ?' = every minute for "
-                        + "testing; '0 0 2 * * ?' = daily 02:00 for production; "
+                description = "Quartz-style cron. Default '0 0 2 * * ?' = daily at 02:00 (correct "
+                        + "for production: a single 23 MB AEM-Reports CSV has been observed to "
+                        + "take 12 hours to generate, so anything tighter than daily would either "
+                        + "skip overlapping triggers under canRunConcurrently=false or starve the "
+                        + "AEM Reports job queue). Other examples: '0 0/1 * * * ?' = every "
+                        + "minute (testing only — do NOT use in prod with REPORTS_API mode); "
                         + "'0 0 2 ? * SUN' = weekly Sunday 02:00. This intentionally is NOT named "
                         + "'scheduler.expression' — that name would auto-route the Runnable "
                         + "through Sling's WhiteboardHandler in parallel with our own "
-                        + "programmatic scheduler.schedule() call, causing double-scheduling. We "
-                        + "use 'cronExpression' so only the explicit programmatic registration "
-                        + "drives the job. scheduler.period is also not supported — the "
-                        + "WhiteboardHandler's expression/period fallback is unreliable on "
-                        + "AEMaaCS (it silently fails when expression is empty).")
-        String cronExpression() default "0 0/1 * * * ?";
+                        + "programmatic scheduler.schedule() call, causing double-scheduling.")
+        String cronExpression() default "0 0 2 * * ?";
 
         @AttributeDefinition(
                 name = "Comment",
@@ -233,6 +233,29 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         + "On hit, the run logs a WARN and stops emitting — events already "
                         + "enqueued are NOT discarded. Default 100 000.")
         int maxFoldersPerRun() default 100_000;
+
+        @AttributeDefinition(
+                name = "Max reported folder depth (0 = unlimited)",
+                description = "Drops folder rows below this depth from event emission. Depth is "
+                        + "counted relative to the report root (e.g. /content/dam/foo = depth 1, "
+                        + "/content/dam/foo/bar = depth 2). Value 0 disables filtering and reports "
+                        + "all depths. APPLIES TO BOTH JCR_WALK AND REPORTS_API STRATEGIES.\n\n"
+                        + "Why this matters at production scale: the real 23 MB sample from "
+                        + "/content/dam has 141 280 folder rows across depths 0–21. Limiting to "
+                        + "maxReportedFolderDepth=4 drops ~91 % of rows (12 417 kept) — a major "
+                        + "performance win for ClickHouse ingestion AND query speed AND the "
+                        + "in-process backlog (less pacing pressure). The discarded deep folders "
+                        + "are still REFLECTED in cumulative sizes of their ancestors (which ARE "
+                        + "emitted), so dashboards built on depth-limited data still show the full "
+                        + "tenant's bytes — they just can't drill below the configured depth.\n\n"
+                        + "JCR_WALK note: the existing 'maxDepth' attribute (default 12) controls "
+                        + "RECURSION depth (we stop descending past it). This new "
+                        + "'maxReportedFolderDepth' controls EMIT depth only — the walk still "
+                        + "descends to maxDepth so cumulative tallies are correct, we just skip "
+                        + "the per-folder event for anything below the report depth.\n\n"
+                        + "Range 0–25. Default 0 (unlimited, behaviour unchanged from previous "
+                        + "releases).")
+        int maxReportedFolderDepth() default 0;
 
         @AttributeDefinition(
                 name = "Run on activate (one-shot)",
@@ -296,18 +319,51 @@ public final class DamDiskUsageReportScheduler implements Runnable {
         String[] reportsApiTenantPaths() default {"/content/dam"};
 
         @AttributeDefinition(
-                name = "Reports API: poll interval (seconds)",
+                name = "Reports API: poll interval seconds (starting)",
                 description = "Seconds between polls of /var/dam/reports/<jobNodeName>.json "
-                        + "during STEP 2. Default 5s (sweet spot for tenant roots up to ~100 k "
-                        + "assets).")
-        int reportsApiPollIntervalSec() default 5;
+                        + "during STEP 2 at the start of polling. The client grows this "
+                        + "geometrically (2× after 1 min, 4× after 10 min, capped at 300s) so a "
+                        + "small starting value is fine even for multi-hour jobs. Default 60s.")
+        int reportsApiPollIntervalSec() default 60;
 
         @AttributeDefinition(
                 name = "Reports API: poll timeout (seconds)",
                 description = "Total seconds to wait for jobStatus=completed before giving up. "
-                        + "Default 600 (10 min) handles tenant roots in the low-millions of "
-                        + "assets. Raise for very large roots; lower for fast-fail.")
-        int reportsApiPollTimeoutSec() default 600;
+                        + "Production observation 2026-05: a 23 MB CSV on /content/dam took 12 "
+                        + "hours to generate, so the default is 43200 (12 h). On timeout, the "
+                        + "AEM-side job is NOT deleted (it may still be running) — operator "
+                        + "must manually clean up /var/dam/reports/<jobNodeName> later.")
+        int reportsApiPollTimeoutSec() default 43_200;
+
+        @AttributeDefinition(
+                name = "Reports API: download timeout (seconds)",
+                description = "Per-call HTTP timeout for STEP 3 only — the GET that downloads "
+                        + "the CSV body. STEPS 1/2/4 use a fixed 60 s timeout (they are tiny "
+                        + "JSON requests). Default 600 (10 min) covers CSVs up to ~100 MB on a "
+                        + "loopback link under load. Raise for very large CSVs.")
+        int reportsApiDownloadTimeoutSec() default 600;
+
+        @AttributeDefinition(
+                name = "Reports API: emit pacing — backlog fill ratio threshold",
+                description = "When the InfralytiqsService's in-memory backlog (configured via "
+                        + "InfralytiqsServiceImpl.queueCapacity, default 50 000 events) crosses "
+                        + "this fill ratio, the emit loop pauses until the backlog drains below "
+                        + "50 % — preventing silent event drops on the non-blocking q.offer() "
+                        + "inside enqueue(). At 200 000 CSV rows in production this matters: "
+                        + "without pacing the queue would overflow ~4× and drop 75 % of events. "
+                        + "Range 0.10 – 0.95; default 0.75 (start pacing at ~37 500 events). "
+                        + "Set to 1.0 to disable pacing.")
+        double reportsApiEmitPacingMaxFillRatio() default 0.75d;
+
+        @AttributeDefinition(
+                name = "Reports API: emit pacing — max wait per event (ms)",
+                description = "Hard cap on how long a single emit may block waiting for the "
+                        + "backlog to drain. On hit, the row is emitted anyway (and may be "
+                        + "dropped by the downstream queue's q.offer() if still full) and a "
+                        + "WARN is logged. Default 30000 (30s). Raise if you see frequent "
+                        + "'pacing wait exceeded' warnings and the underlying ClickHouse HTTP "
+                        + "pipeline is slow.")
+        long reportsApiEmitPacingMaxWaitMs() default 30_000L;
     }
 
     /** Strategy switch for {@link DamDiskUsageReportCfg#mode()}. */
@@ -346,10 +402,20 @@ public final class DamDiskUsageReportScheduler implements Runnable {
     @Activate
     void activate(DamDiskUsageReportCfg c) {
         this.cfg = c;
-        LOG.info("[{}] activate — enableScheduler={} cronExpression='{}' roots={} includeRenditions={} subService='{}' maxDepth={} maxFoldersPerRun={} runOnActivate={}",
-                PID, c.enableScheduler(), c.cronExpression(),
+        LOG.info("[{}] activate — enableScheduler={} cronExpression='{}' mode='{}' roots={} includeRenditions={} subService='{}' maxDepth={} maxFoldersPerRun={} maxReportedFolderDepth={} runOnActivate={}",
+                PID, c.enableScheduler(), c.cronExpression(), c.mode(),
                 Arrays.toString(c.reportRootPaths()), c.includeRenditions(), c.subService(),
-                c.maxDepth(), c.maxFoldersPerRun(), c.runOnActivate());
+                c.maxDepth(), c.maxFoldersPerRun(), c.maxReportedFolderDepth(),
+                c.runOnActivate());
+        // Log REPORTS_API config separately to keep the primary banner readable. Password is
+        // intentionally only echoed as <set>/<unset> — never logged in clear.
+        LOG.info("[{}] activate — REPORTS_API reportsApiBaseUrl='{}' reportsApiUsername='{}' reportsApiPasswordPresent={} reportsApiTenantPaths={} pollIntervalSec={} pollTimeoutSec={} downloadTimeoutSec={} emitPacingMaxFillRatio={} emitPacingMaxWaitMs={}",
+                PID, c.reportsApiBaseUrl(), c.reportsApiUsername(),
+                c.reportsApiPassword() != null && !c.reportsApiPassword().isEmpty(),
+                Arrays.toString(c.reportsApiTenantPaths()),
+                c.reportsApiPollIntervalSec(), c.reportsApiPollTimeoutSec(),
+                c.reportsApiDownloadTimeoutSec(), c.reportsApiEmitPacingMaxFillRatio(),
+                c.reportsApiEmitPacingMaxWaitMs());
 
         applySchedule(c);
 
@@ -476,10 +542,12 @@ public final class DamDiskUsageReportScheduler implements Runnable {
         long stratNanos = System.nanoTime();
         AtomicLong foldersVisited = new AtomicLong();
         AtomicLong eventsEmitted = new AtomicLong();
+        AtomicLong eventsSkippedByDepthFilter = new AtomicLong();
+        int maxReportedDepth = Math.max(0, live.maxReportedFolderDepth());
 
-        LOG.info("[{}] JCR_WALK strategy STARTED — runId={} roots={} includeRenditions={} subService='{}'",
+        LOG.info("[{}] JCR_WALK strategy STARTED — runId={} roots={} includeRenditions={} subService='{}' maxReportedFolderDepth={}",
                 PID, runId, Arrays.toString(live.reportRootPaths()), live.includeRenditions(),
-                live.subService());
+                live.subService(), maxReportedDepth);
 
         Map<String, Object> authInfo = new HashMap<>();
         authInfo.put(ResourceResolverFactory.SUBSERVICE, live.subService());
@@ -501,7 +569,7 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                 }
                 LOG.info("[{}] JCR_WALK walking root='{}' (runId={})", PID, rootPath, runId);
                 FolderStats stats = walkRoot(root, live, runId, startIso, rootPath,
-                        foldersVisited, eventsEmitted);
+                        foldersVisited, eventsEmitted, eventsSkippedByDepthFilter, maxReportedDepth);
                 LOG.info("[{}] JCR_WALK root='{}' DONE — bytes={} assets={} folders={} (runId={})",
                         PID, rootPath, stats.bytesCumulative + stats.bytesSelf,
                         stats.assetsCumulative + stats.assetsSelf,
@@ -521,8 +589,9 @@ public final class DamDiskUsageReportScheduler implements Runnable {
         }
 
         long elapsedMs = (System.nanoTime() - stratNanos) / 1_000_000L;
-        LOG.info("[{}] JCR_WALK strategy COMPLETE — runId={} foldersVisited={} eventsEmitted={} elapsedMs={}",
-                PID, runId, foldersVisited.get(), eventsEmitted.get(), elapsedMs);
+        LOG.info("[{}] JCR_WALK strategy COMPLETE — runId={} foldersVisited={} eventsEmitted={} eventsSkippedByDepthFilter={} maxReportedFolderDepth={} elapsedMs={}",
+                PID, runId, foldersVisited.get(), eventsEmitted.get(),
+                eventsSkippedByDepthFilter.get(), maxReportedDepth, elapsedMs);
     }
 
     /**
@@ -558,18 +627,50 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                 live.reportsApiUsername(),
                 live.reportsApiPassword(),
                 live.reportsApiPollIntervalSec(),
-                live.reportsApiPollTimeoutSec());
+                live.reportsApiPollTimeoutSec(),
+                live.reportsApiDownloadTimeoutSec());
+
+        // Per-emit counters shared with the emit callback for periodic INFO summaries (every
+        // 5 000 rows by default, to avoid 200 000 per-row INFO lines flooding Loki). The skip
+        // counter tracks rows dropped by the maxReportedFolderDepth filter — useful for
+        // verifying the filter is working as intended.
+        final AtomicLong emitCounter = new AtomicLong();
+        final AtomicLong skipCounter = new AtomicLong();
+        final double pacingThreshold = clamp(live.reportsApiEmitPacingMaxFillRatio(), 0.10d, 1.0d);
+        final long pacingMaxWaitMs = Math.max(0L, live.reportsApiEmitPacingMaxWaitMs());
+        final int maxReportedDepth = Math.max(0, live.maxReportedFolderDepth());
 
         long totalEmitted = 0;
         for (String tenant : tenants) {
             try {
                 int emitted = client.runForTenant(tenant,
-                        (row, tenantRoot, jobTitle, jobNodeName, rId, sIso) ->
-                                emitReportsApiFolderEvent(row, tenantRoot, jobTitle, jobNodeName, rId, sIso),
+                        (row, tenantRoot, jobTitle, jobNodeName, rId, sIso) -> {
+                            // Depth-filter FIRST — before any payload construction or pacing.
+                            // We compute depth from the path (very cheap: a few char scans), and
+                            // when filtered we save (a) the InfralytiqsAnalyticsPayload.Builder
+                            // allocation + ~10 dimension/metric writes, (b) the enqueue +
+                            // queue-offer cost, (c) the pacing sleep, and (d) downstream HTTP +
+                            // ClickHouse INSERT row. At 91 % drop rate (maxDepth=4 on the real
+                            // production CSV) that's a ~10× speedup of the emit phase.
+                            int depth = computeDepth(tenantRoot,
+                                    row.path == null ? "" : row.path);
+                            if (maxReportedDepth > 0 && depth > maxReportedDepth) {
+                                long sk = skipCounter.incrementAndGet();
+                                if (sk % EMIT_SUMMARY_EVERY == 0 && LOG.isDebugEnabled()) {
+                                    LOG.debug("[{}] REPORTS_API depth-filter skipped {} rows so far (current path='{}' depth={} > maxReportedFolderDepth={}) runId={}",
+                                            PID, sk, row.path, depth, maxReportedDepth, rId);
+                                }
+                                return;
+                            }
+                            paceForBacklog(pacingThreshold, pacingMaxWaitMs, rId);
+                            emitReportsApiFolderEvent(row, tenantRoot, jobTitle, jobNodeName,
+                                    rId, sIso, emitCounter, depth);
+                        },
                         runId, startIso);
                 totalEmitted += emitted;
-                LOG.info("[{}] REPORTS_API tenant='{}' DONE — eventsEmitted={} runId={}",
-                        PID, tenant, emitted, runId);
+                LOG.info("[{}] REPORTS_API tenant='{}' DONE — rowsReceived={} eventsEmitted={} eventsSkippedByDepthFilter={} maxReportedFolderDepth={} runId={}",
+                        PID, tenant, emitted + skipCounter.get(), emitCounter.get(),
+                        skipCounter.get(), maxReportedDepth, runId);
             } catch (RuntimeException ex) {
                 LOG.error("[{}] REPORTS_API tenant='{}' FAILED runId={}: {}",
                         PID, tenant, runId, ex.toString(), ex);
@@ -577,8 +678,61 @@ public final class DamDiskUsageReportScheduler implements Runnable {
         }
 
         long elapsedMs = (System.nanoTime() - stratNanos) / 1_000_000L;
-        LOG.info("[{}] REPORTS_API strategy COMPLETE — runId={} tenants={} totalEventsEmitted={} elapsedMs={}",
-                PID, runId, tenants.length, totalEmitted, elapsedMs);
+        LOG.info("[{}] REPORTS_API strategy COMPLETE — runId={} tenants={} totalEventsEmitted={} totalSkippedByDepthFilter={} maxReportedFolderDepth={} elapsedMs={}",
+                PID, runId, tenants.length, totalEmitted, skipCounter.get(),
+                maxReportedDepth, elapsedMs);
+    }
+
+    /**
+     * Self-pacing helper: when the ingest pipeline's in-memory backlog crosses
+     * {@code maxFillRatio}, sleep in 50 ms ticks until it drains below 50 % OR
+     * {@code maxWaitMs} elapses. Prevents bulk emitters (this scheduler) from silently
+     * overflowing the 4 096-event {@link java.util.concurrent.LinkedBlockingQueue} inside
+     * {@code InfralytiqsServiceImpl.enqueue()} which drops on {@code q.offer()} failure.
+     *
+     * <p>Calling this once before every {@code enqueue} adds zero overhead in steady state
+     * (the queue is rarely full) and a bounded {@code maxWaitMs} when it is. The HTTP
+     * pipeline drains 4 096 events typically in <2 s, so the default 30 s ceiling almost
+     * never fires.
+     */
+    private void paceForBacklog(double maxFillRatio, long maxWaitMs, String runId) {
+        InfralytiqsService ingest = ingestPipeline;
+        if (ingest == null) {
+            return;
+        }
+        int size = ingest.approximateBacklogSize();
+        int cap = ingest.approximateBacklogCapacity();
+        if (size < 0 || cap <= 0 || cap == Integer.MAX_VALUE) {
+            return; // introspection not supported / unbounded queue
+        }
+        if (size < cap * maxFillRatio) {
+            return; // fast path — backlog is fine
+        }
+        long startNanos = System.nanoTime();
+        long deadlineMs = maxWaitMs;
+        double drainTarget = cap * 0.5d;
+        while (true) {
+            size = ingest.approximateBacklogSize();
+            if (size < 0 || size < drainTarget) {
+                return; // drained sufficiently
+            }
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            if (elapsedMs >= deadlineMs) {
+                LOG.warn("[{}] pacing wait exceeded {}ms — backlog still at {}/{} (~{}% full); emitting anyway (runId={})",
+                        PID, deadlineMs, size, cap, (size * 100) / Math.max(1, cap), runId);
+                return;
+            }
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     /**
@@ -586,15 +740,20 @@ public final class DamDiskUsageReportScheduler implements Runnable {
      * Mirrors {@link #emitFolderEvent(Frame, String, String, String)} field-for-field so the
      * two strategies are pivot-compatible in ClickHouse, with the {@code report_strategy}
      * dimension being the only required disambiguator.
+     *
+     * <p>Per-row logging is intentionally DEBUG-level only — at 200 000 rows per production
+     * scan, INFO-per-row would emit ~50 MB of Loki traffic per run. The summary INFO line
+     * below is emitted every {@value #EMIT_SUMMARY_EVERY} rows so an operator can verify the
+     * loop is alive in real time.
      */
     private void emitReportsApiFolderEvent(ReportsApiClient.ReportsApiRow row,
             String tenantRootPath, String jobTitle, String jobNodeName, String runId,
-            String startIso) {
+            String startIso, AtomicLong emitCounter, int depth) {
         String path = row.path == null ? "" : row.path;
         String name = row.name == null ? nameOf(path) : row.name;
         String parent = parentOf(path);
-        // AEM-Reports CSV doesn't carry folder depth — derive it relative to the tenant root.
-        int depth = computeDepth(tenantRootPath, path);
+        // 'depth' is already computed by the caller (so the same value is reused for both the
+        // depth-filter check and the emit dimension — no redundant string parsing).
 
         InfralytiqsAnalyticsPayload.Builder b =
                 InfralytiqsAnalyticsPayload.builder("asset_disk_usage_report")
@@ -622,9 +781,21 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         ingestPipeline.enqueue(b.build());
 
-        LOG.info("[{}] REPORTS_API emit folder='{}' depth={} bytes={} assets={} runId={}",
-                PID, path, depth, row.sizeBytes, row.assetCount, runId);
+        long n = emitCounter.incrementAndGet();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("[{}] REPORTS_API emit folder='{}' depth={} bytes={} assets={} (#{} runId={})",
+                    PID, path, depth, row.sizeBytes, row.assetCount, n, runId);
+        }
+        if (n % EMIT_SUMMARY_EVERY == 0) {
+            int backlogSize = ingestPipeline.approximateBacklogSize();
+            int backlogCap = ingestPipeline.approximateBacklogCapacity();
+            LOG.info("[{}] REPORTS_API emit progress — rowsEmitted={} backlog={}/{} runId={}",
+                    PID, n, backlogSize, backlogCap, runId);
+        }
     }
+
+    /** Cadence for the INFO progress line during bulk REPORTS_API emits. */
+    private static final int EMIT_SUMMARY_EVERY = 5_000;
 
     /**
      * Folder depth relative to {@code rootPath}. {@code /content/dam/foo} under
@@ -663,7 +834,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
      * regardless of tree depth.
      */
     private FolderStats walkRoot(Resource rootFolder, DamDiskUsageReportCfg c, String runId,
-            String startIso, String rootPath, AtomicLong foldersVisited, AtomicLong eventsEmitted) {
+            String startIso, String rootPath, AtomicLong foldersVisited, AtomicLong eventsEmitted,
+            AtomicLong eventsSkippedByDepthFilter, int maxReportedDepth) {
 
         LinkedList<Frame> stack = new LinkedList<>();
         stack.push(new Frame(rootFolder, 0, null));
@@ -707,8 +879,16 @@ public final class DamDiskUsageReportScheduler implements Runnable {
             } else {
                 stack.pop();
                 frame.stats.foldersCumulative += 1L;
-                emitFolderEvent(frame, runId, startIso, rootPath);
-                eventsEmitted.incrementAndGet();
+                // Always MERGE child stats into parent (preserves cumulative aggregation even
+                // when deep folders are not individually emitted to ClickHouse). The emit
+                // decision is independent of the merge — it's purely a filter on the
+                // analytics-event stream.
+                if (maxReportedDepth > 0 && frame.depth > maxReportedDepth) {
+                    eventsSkippedByDepthFilter.incrementAndGet();
+                } else {
+                    emitFolderEvent(frame, runId, startIso, rootPath);
+                    eventsEmitted.incrementAndGet();
+                }
                 if (frame.parent != null) {
                     frame.parent.merge(frame.stats);
                 } else {
@@ -750,8 +930,10 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         ingestPipeline.enqueue(b.build());
 
-        LOG.info("[{}] JCR_WALK emit folder='{}' depth={} self[bytes={},assets={}] cumul[bytes={},assets={}] runId={}",
-                PID, path, frame.depth, s.bytesSelf, s.assetsSelf, bytesCumul, assetsCumul, runId);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("[{}] JCR_WALK emit folder='{}' depth={} self[bytes={},assets={}] cumul[bytes={},assets={}] runId={}",
+                    PID, path, frame.depth, s.bytesSelf, s.assetsSelf, bytesCumul, assetsCumul, runId);
+        }
     }
 
     /**

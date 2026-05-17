@@ -5,7 +5,9 @@ import com.adobexp.log.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.StringReader;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -104,11 +106,20 @@ public final class ReportsApiClient {
     private static final DateTimeFormatter JOB_TS_FORMAT =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
 
+    /** Per-call HTTP timeouts. STEP 1/2/4 are tiny JSON requests; STEP 3 can be a large CSV. */
+    private static final Duration STEP_124_HTTP_TIMEOUT = Duration.ofSeconds(60);
+
+    /** Hard ceiling for adaptive poll-interval growth — never wait longer than this between polls. */
+    private static final int ADAPTIVE_POLL_INTERVAL_MAX_SEC = 300;
+
+    /** How often to log a "still waiting" progress line during long polls. */
+    private static final long POLL_PROGRESS_LOG_EVERY_MS = 5L * 60 * 1000;
+
     private final String baseUrl;
     private final String basicAuthHeader;
     private final int pollIntervalSec;
     private final int pollTimeoutSec;
-    private final Duration httpRequestTimeout;
+    private final Duration downloadTimeout;
     private final ObjectMapper json = new ObjectMapper();
 
     /**
@@ -119,22 +130,43 @@ public final class ReportsApiClient {
      * @param password basic-auth password (per PDF "delivered on request basis"). May be empty
      *                 only if the AEM instance is configured for anonymous access — which is
      *                 never the case in production.
-     * @param pollIntervalSec seconds between polls of step 2. 3–10s is the sweet spot — too
-     *                        short = wasted CPU, too long = report-completion-to-event latency.
+     * @param pollIntervalSec seconds between polls of step 2 at the START of polling. The
+     *                        client adaptively grows this up to {@value #ADAPTIVE_POLL_INTERVAL_MAX_SEC}s
+     *                        as the job ages, so a small starting value (5–60s) is fine even
+     *                        for multi-hour jobs.
      * @param pollTimeoutSec  total seconds we'll wait for {@code jobStatus=completed} before
-     *                        giving up. 600 (10 min) handles tenant roots with millions of
-     *                        assets.
+     *                        giving up. Production observation 2026-05: a 23 MB CSV on
+     *                        {@code /content/dam} took 12 hours to generate — set to
+     *                        {@code 43200}+ for those roots.
+     * @param downloadTimeoutSec  per-call HTTP timeout for STEP 3 only — the GET that
+     *                            downloads the CSV body. STEPS 1/2/4 use a fixed 60 s timeout
+     *                            (they are tiny JSON requests over loopback). 600 s (10 min)
+     *                            is the default and covers CSVs up to ~100 MB on a loopback
+     *                            link under load.
      */
     public ReportsApiClient(String baseUrl, String username, String password,
-            int pollIntervalSec, int pollTimeoutSec) {
+            int pollIntervalSec, int pollTimeoutSec, int downloadTimeoutSec) {
         this.baseUrl = baseUrl == null ? "" : baseUrl.replaceAll("/+$", "");
         String credentials = (username == null ? "" : username) + ":" + (password == null ? "" : password);
         this.basicAuthHeader = "Basic " + Base64.getEncoder()
                 .encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
         this.pollIntervalSec = Math.max(1, pollIntervalSec);
         this.pollTimeoutSec = Math.max(pollIntervalSec, pollTimeoutSec);
-        // 60s is generous for a loopback request; report CSVs at the upper end are <10 MB.
-        this.httpRequestTimeout = Duration.ofSeconds(60);
+        this.downloadTimeout = Duration.ofSeconds(Math.max(60, downloadTimeoutSec));
+    }
+
+    /** Outcome of STEP 2 — three-valued so callers can react differently. */
+    enum PollResult {
+        /** {@code jobStatus=completed} observed. STEP 3 + STEP 4 should both run. */
+        COMPLETED,
+        /** Wall-clock deadline ({@link #pollTimeoutSec}) reached without seeing completion.
+         *  The job may still be running on AEM; STEP 4 cleanup is SKIPPED to avoid cancelling
+         *  it. Operator must manually delete the orphan node from {@code /var/dam/reports}
+         *  when the job eventually finishes (or fails). */
+        TIMED_OUT,
+        /** {@code jobStatus=failed} / {@code error} observed, or polling was interrupted.
+         *  STEP 4 cleanup STILL runs (the AEM job is terminal-non-success). */
+        FAILED
     }
 
     /**
@@ -155,6 +187,7 @@ public final class ReportsApiClient {
         String jobNodeName = null;
         int emitted = 0;
         long stepStartNanos = System.nanoTime();
+        PollResult pollResult = PollResult.FAILED;
 
         try {
             // ─── STEP 1: create job ──────────────────────────────────────────────────────
@@ -169,19 +202,25 @@ public final class ReportsApiClient {
             LOG.info("[ReportsApiClient] STEP 1 createJob OK tenant='{}' jobNodeName='{}' (runId={})",
                     tenantRootPath, jobNodeName, runId);
 
-            // ─── STEP 2: poll until jobStatus=completed ─────────────────────────────────
-            LOG.info("[ReportsApiClient] STEP 2 poll begin tenant='{}' jobNodeName='{}' pollIntervalSec={} pollTimeoutSec={} (runId={})",
-                    tenantRootPath, jobNodeName, pollIntervalSec, pollTimeoutSec, runId);
-            boolean ready = pollUntilCompleted(jobNodeName, runId);
-            if (!ready) {
-                LOG.error("[ReportsApiClient] STEP 2 poll TIMED OUT tenant='{}' jobNodeName='{}' after {}s (runId={})",
-                        tenantRootPath, jobNodeName, pollTimeoutSec, runId);
+            // ─── STEP 2: poll until jobStatus=completed (adaptive interval) ────────────
+            LOG.info("[ReportsApiClient] STEP 2 poll begin tenant='{}' jobNodeName='{}' startIntervalSec={} maxIntervalSec={} timeoutSec={} (runId={})",
+                    tenantRootPath, jobNodeName, pollIntervalSec, ADAPTIVE_POLL_INTERVAL_MAX_SEC,
+                    pollTimeoutSec, runId);
+            pollResult = pollUntilCompleted(jobNodeName, runId);
+            if (pollResult == PollResult.TIMED_OUT) {
+                LOG.error("[ReportsApiClient] STEP 2 poll TIMED OUT tenant='{}' jobNodeName='{}' after {}s — SKIPPING STEP 4 cleanup so AEM can finish the job. Manually DELETE /var/dam/reports/{} once it completes. (runId={})",
+                        tenantRootPath, jobNodeName, pollTimeoutSec, jobNodeName, runId);
+                return 0;
+            }
+            if (pollResult == PollResult.FAILED) {
+                LOG.error("[ReportsApiClient] STEP 2 poll observed FAILED jobStatus tenant='{}' jobNodeName='{}' (runId={})",
+                        tenantRootPath, jobNodeName, runId);
                 return 0;
             }
             LOG.info("[ReportsApiClient] STEP 2 poll OK tenant='{}' jobNodeName='{}' (runId={})",
                     tenantRootPath, jobNodeName, runId);
 
-            // ─── STEP 3: download CSV ───────────────────────────────────────────────────
+            // ─── STEP 3: download CSV + STREAM-parse + emit row-by-row ──────────────────
             LOG.info("[ReportsApiClient] STEP 3 downloadCsv tenant='{}' jobNodeName='{}' jobTitle='{}' (runId={})",
                     tenantRootPath, jobNodeName, jobTitle, runId);
             String csv = downloadCsv(jobNodeName, jobTitle);
@@ -190,26 +229,25 @@ public final class ReportsApiClient {
                         tenantRootPath, runId);
                 return 0;
             }
-            List<ReportsApiRow> rows = parseCsv(csv);
-            LOG.info("[ReportsApiClient] STEP 3 downloadCsv OK tenant='{}' csvBytes={} parsedRows={} (runId={})",
-                    tenantRootPath, csv.length(), rows.size(), runId);
-
-            // Emit one analytics event per CSV row. We emit BEFORE STEP 4 so even if cleanup
-            // fails the data still reaches ClickHouse.
-            for (ReportsApiRow row : rows) {
-                emitter.emit(row, tenantRootPath, jobTitle, jobNodeName, runId, startIso);
-                emitted++;
-            }
+            LOG.info("[ReportsApiClient] STEP 3 downloadCsv OK tenant='{}' csvBytes={} (runId={}) — beginning streaming parse",
+                    tenantRootPath, csv.length(), runId);
+            emitted = parseAndEmitStreaming(csv, tenantRootPath, jobTitle, jobNodeName, runId, startIso, emitter);
+            LOG.info("[ReportsApiClient] STEP 3 streaming parse + emit COMPLETE tenant='{}' rowsEmitted={} (runId={})",
+                    tenantRootPath, emitted, runId);
 
         } catch (RuntimeException ex) {
             LOG.error("[ReportsApiClient] flow FAILED tenant='{}' jobNodeName='{}' (runId={}): {}",
                     tenantRootPath, jobNodeName, runId, ex.toString(), ex);
         } finally {
-            // ─── STEP 4: cleanup ───────────────────────────────────────────────────────
-            if (jobNodeName != null) {
+            // STEP 4 cleanup — but ONLY when the job reached a terminal AEM-side state
+            // (COMPLETED or FAILED). On TIMED_OUT the job may still be running; deleting its
+            // node would cancel AEM's in-flight work and leave temp artifacts under
+            // /var/dam/temp. The operator can either DELETE manually after AEM finishes, or
+            // configure /var/dam/reports cleanup to run separately.
+            if (jobNodeName != null && pollResult != PollResult.TIMED_OUT) {
                 try {
-                    LOG.info("[ReportsApiClient] STEP 4 cleanup tenant='{}' jobNodeName='{}' (runId={})",
-                            tenantRootPath, jobNodeName, runId);
+                    LOG.info("[ReportsApiClient] STEP 4 cleanup tenant='{}' jobNodeName='{}' pollResult={} (runId={})",
+                            tenantRootPath, jobNodeName, pollResult, runId);
                     boolean ok = deleteJob(jobNodeName);
                     if (ok) {
                         LOG.info("[ReportsApiClient] STEP 4 cleanup OK tenant='{}' jobNodeName='{}' (runId={})",
@@ -222,6 +260,9 @@ public final class ReportsApiClient {
                     LOG.warn("[ReportsApiClient] STEP 4 cleanup threw tenant='{}' jobNodeName='{}' (runId={}): {}",
                             tenantRootPath, jobNodeName, runId, ex.toString());
                 }
+            } else if (jobNodeName != null) {
+                LOG.warn("[ReportsApiClient] STEP 4 cleanup SKIPPED (poll TIMED_OUT) — orphan node /var/dam/reports/{} requires manual cleanup once AEM finishes (runId={})",
+                        jobNodeName, runId);
             }
         }
 
@@ -272,7 +313,7 @@ public final class ReportsApiClient {
 
         HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/libs/dam/gui/content/reports/generatereport.export.json"))
-                .timeout(httpRequestTimeout)
+                .timeout(STEP_124_HTTP_TIMEOUT)
                 .header("Authorization", basicAuthHeader)
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .header("Accept", "application/json")
@@ -298,17 +339,39 @@ public final class ReportsApiClient {
 
     /**
      * STEP 2 — poll {@code /var/dam/reports/<jobNodeName>.json} until
-     * {@code jobStatus=completed}. Returns false on timeout. Logs one INFO line per poll so
-     * Loki shows the progression.
+     * {@code jobStatus=completed} or the {@link #pollTimeoutSec} deadline expires.
+     *
+     * <h3>Adaptive polling</h3>
+     *
+     * <p>Production observation 2026-05: AEM-Reports on {@code /content/dam} took 12 hours to
+     * generate a 23 MB CSV. Polling every 5 s for 12 h = 8 640 poll requests + log lines —
+     * pointless load when AEM reports its own status no faster than once per ~30 s anyway.
+     * Therefore we grow the interval geometrically:
+     * <ul>
+     *   <li>0 – 1 min: the configured {@link #pollIntervalSec} (default 60s)</li>
+     *   <li>1 – 10 min: max(60s, 2× configured)</li>
+     *   <li>10 – 60 min: max(120s, 4× configured), capped at {@value #ADAPTIVE_POLL_INTERVAL_MAX_SEC}s</li>
+     *   <li>60 min+: capped at {@value #ADAPTIVE_POLL_INTERVAL_MAX_SEC}s</li>
+     * </ul>
+     *
+     * <p>Every {@value #POLL_PROGRESS_LOG_EVERY_MS}ms (5 min) a one-line INFO "still waiting"
+     * progress line is emitted so an operator can see the polling is alive without a per-poll
+     * log line. Per-poll lines are demoted to DEBUG.
+     *
+     * @return {@link PollResult#COMPLETED} on success, {@link PollResult#FAILED} on terminal-
+     *         non-success ({@code failed}/{@code error}/interrupt), {@link PollResult#TIMED_OUT}
+     *         when {@link #pollTimeoutSec} elapses without observing completion.
      */
-    boolean pollUntilCompleted(String jobNodeName, String runId) {
-        Instant deadline = Instant.now().plusSeconds(pollTimeoutSec);
+    PollResult pollUntilCompleted(String jobNodeName, String runId) {
+        Instant start = Instant.now();
+        Instant deadline = start.plusSeconds(pollTimeoutSec);
+        long nextProgressLogMs = POLL_PROGRESS_LOG_EVERY_MS;
         int attempts = 0;
         while (Instant.now().isBefore(deadline)) {
             attempts++;
             HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "/var/dam/reports/" + jobNodeName + ".json"))
-                    .timeout(httpRequestTimeout)
+                    .timeout(STEP_124_HTTP_TIMEOUT)
                     .header("Authorization", basicAuthHeader)
                     .header("Accept", "application/json")
                     .GET()
@@ -319,15 +382,18 @@ public final class ReportsApiClient {
                     JsonNode tree = json.readTree(resp.body());
                     JsonNode statusNode = tree.get("jobStatus");
                     String status = statusNode == null ? "<missing>" : statusNode.asText();
-                    LOG.info("[ReportsApiClient] STEP 2 poll attempt={} jobStatus='{}' jobNodeName='{}' (runId={})",
+                    LOG.debug("[ReportsApiClient] STEP 2 poll attempt={} jobStatus='{}' jobNodeName='{}' (runId={})",
                             attempts, status, jobNodeName, runId);
                     if ("completed".equalsIgnoreCase(status)) {
-                        return true;
+                        long waitSec = Duration.between(start, Instant.now()).getSeconds();
+                        LOG.info("[ReportsApiClient] STEP 2 poll observed COMPLETED after {}s ({} polls) jobNodeName='{}' (runId={})",
+                                waitSec, attempts, jobNodeName, runId);
+                        return PollResult.COMPLETED;
                     }
                     if ("failed".equalsIgnoreCase(status) || "error".equalsIgnoreCase(status)) {
                         LOG.error("[ReportsApiClient] STEP 2 poll jobStatus='{}' is terminal-non-success — aborting (runId={})",
                                 status, runId);
-                        return false;
+                        return PollResult.FAILED;
                     }
                 } catch (IOException ex) {
                     LOG.warn("[ReportsApiClient] STEP 2 poll unparseable JSON attempt={} body='{}' err={}",
@@ -338,34 +404,70 @@ public final class ReportsApiClient {
                         resp.statusCode(), attempts, jobNodeName, runId);
             }
 
+            long elapsedMs = Duration.between(start, Instant.now()).toMillis();
+            if (elapsedMs >= nextProgressLogMs) {
+                long elapsedMin = elapsedMs / 60_000L;
+                long remainingMin = (pollTimeoutSec * 1000L - elapsedMs) / 60_000L;
+                LOG.info("[ReportsApiClient] STEP 2 still polling — elapsed={}m, remaining={}m, attempts={} jobNodeName='{}' (runId={})",
+                        elapsedMin, remainingMin, attempts, jobNodeName, runId);
+                nextProgressLogMs += POLL_PROGRESS_LOG_EVERY_MS;
+            }
+
+            int sleepSec = adaptivePollIntervalSec(elapsedMs);
             try {
-                Thread.sleep(pollIntervalSec * 1000L);
+                Thread.sleep(sleepSec * 1000L);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 LOG.warn("[ReportsApiClient] STEP 2 poll interrupted at attempt={} (runId={})",
                         attempts, runId);
-                return false;
+                return PollResult.FAILED;
             }
         }
-        return false;
+        return PollResult.TIMED_OUT;
     }
 
-    /** STEP 3 — download the CSV body. Returns the raw response body string. */
+    /**
+     * Adaptive poll interval growth: {@code configured} for the first minute, {@code 2×} for
+     * 1–10 min, {@code 4×} for 10–60 min, capped at {@link #ADAPTIVE_POLL_INTERVAL_MAX_SEC}s.
+     * Visible for testing.
+     */
+    int adaptivePollIntervalSec(long elapsedMs) {
+        int base;
+        if (elapsedMs < 60_000L) {
+            base = pollIntervalSec;
+        } else if (elapsedMs < 600_000L) {
+            base = Math.max(60, pollIntervalSec * 2);
+        } else {
+            base = Math.max(120, pollIntervalSec * 4);
+        }
+        return Math.min(base, ADAPTIVE_POLL_INTERVAL_MAX_SEC);
+    }
+
+    /**
+     * STEP 3 — download the CSV body. Uses the configurable {@link #downloadTimeout} (default
+     * 10 min) instead of the small per-call timeout for STEPS 1/2/4. CSV bodies in production
+     * have been observed at 23 MB; the 10-min default tolerates ~40 MB/s sustained on a busy
+     * loopback link, with plenty of headroom.
+     */
     String downloadCsv(String jobNodeName, String jobTitle) {
         String url = baseUrl + "/var/dam/reports/" + jobNodeName + "/"
                 + urlEncode(jobTitle) + ".csv";
+        long startNanos = System.nanoTime();
         HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .timeout(httpRequestTimeout)
+                .timeout(downloadTimeout)
                 .header("Authorization", basicAuthHeader)
                 .header("Accept", "text/csv,*/*;q=0.5")
                 .GET()
                 .build());
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
         if (resp.statusCode() != 200) {
-            LOG.error("[ReportsApiClient] STEP 3 downloadCsv HTTP {} url='{}' bodyHead='{}'",
-                    resp.statusCode(), url, truncate(resp.body(), 200));
+            LOG.error("[ReportsApiClient] STEP 3 downloadCsv HTTP {} url='{}' elapsedMs={} bodyHead='{}'",
+                    resp.statusCode(), url, elapsedMs, truncate(resp.body(), 200));
             return null;
         }
+        LOG.debug("[ReportsApiClient] STEP 3 downloadCsv transport done bytes={} elapsedMs={}",
+                resp.body() == null ? 0 : resp.body().length(), elapsedMs);
         return resp.body();
     }
 
@@ -373,7 +475,7 @@ public final class ReportsApiClient {
     boolean deleteJob(String jobNodeName) {
         HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/libs/dam/gui/content/reports/generatereport.export.json/" + jobNodeName))
-                .timeout(httpRequestTimeout)
+                .timeout(STEP_124_HTTP_TIMEOUT)
                 .header("Authorization", basicAuthHeader)
                 .DELETE()
                 .build());
@@ -381,7 +483,89 @@ public final class ReportsApiClient {
     }
 
     /**
-     * Parses the report CSV. PDF format:
+     * Streaming variant of {@link #parseCsv(String)} — reads the CSV one line at a time via
+     * {@link BufferedReader} and invokes {@code emitter} on each parsed row immediately
+     * (instead of materialising the full {@code List<ReportsApiRow>}). At 23 MB / ~200 000
+     * rows in production this is what keeps heap pressure constant: peak heap usage during
+     * STEP 3 is bounded by one CSV line + one {@code ReportsApiRow}, not the full file.
+     *
+     * <p>UTF-8 BOM is stripped at the start of the body before reading; header validation is
+     * identical to {@link #parseCsv(String)}. Returns the number of rows successfully emitted.
+     */
+    int parseAndEmitStreaming(String csv, String tenantRootPath, String jobTitle,
+            String jobNodeName, String runId, String startIso, RowEmitter emitter) {
+        if (csv == null || csv.isEmpty()) {
+            return 0;
+        }
+        if (csv.charAt(0) == '\uFEFF') {
+            csv = csv.substring(1);
+        }
+        try (BufferedReader reader = new BufferedReader(new StringReader(csv))) {
+            String headerLine = reader.readLine();
+            if (headerLine == null) {
+                return 0;
+            }
+            String[] headers = splitCsvLine(headerLine);
+            int idxName = -1;
+            int idxSize = -1;
+            int idxAssetCount = -1;
+            int idxPath = -1;
+            for (int i = 0; i < headers.length; i++) {
+                String h = stripBomAndTrim(headers[i]).toLowerCase(Locale.ROOT);
+                if ("name".equals(h)) {
+                    idxName = i;
+                } else if ("size".equals(h)) {
+                    idxSize = i;
+                } else if ("asset count".equals(h)) {
+                    idxAssetCount = i;
+                } else if ("path".equals(h)) {
+                    idxPath = i;
+                }
+            }
+            if (idxName < 0 || idxSize < 0 || idxAssetCount < 0 || idxPath < 0) {
+                LOG.error("[ReportsApiClient] parseAndEmitStreaming missing required column(s) — headers={} (need NAME, SIZE, ASSET COUNT, PATH)",
+                        Arrays.toString(headers));
+                return 0;
+            }
+            int maxIdx = Math.max(Math.max(idxName, idxSize), Math.max(idxAssetCount, idxPath));
+            int emitted = 0;
+            int lineNo = 0;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lineNo++;
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                String[] cells = splitCsvLine(trimmed);
+                if (cells.length <= maxIdx) {
+                    LOG.debug("[ReportsApiClient] parseAndEmitStreaming skipping short line[{}]: '{}'", lineNo, trimmed);
+                    continue;
+                }
+                String name = stripBomAndTrim(cells[idxName]);
+                String path = stripBomAndTrim(cells[idxPath]);
+                long sizeBytes = parseSizeBytes(cells[idxSize]);
+                int assetCount = parseInt(cells[idxAssetCount]);
+                emitter.emit(new ReportsApiRow(name, sizeBytes, assetCount, path),
+                        tenantRootPath, jobTitle, jobNodeName, runId, startIso);
+                emitted++;
+            }
+            return emitted;
+        } catch (IOException ex) {
+            // BufferedReader over a StringReader never throws IOException in practice — kept for
+            // contract-completeness; we promote to a runtime error so the outer flow logs it.
+            throw new RuntimeException("Unexpected IO error during streaming CSV parse: " + ex, ex);
+        }
+    }
+
+    /**
+     * Materialising variant of the CSV parser — returns the full {@code List<ReportsApiRow>}
+     * in memory. <b>Kept only for unit-test convenience</b>; the production code path is
+     * {@link #parseAndEmitStreaming} which processes the CSV one row at a time and never
+     * materialises the full list. Don't call this on production-sized CSVs (23 MB observed)
+     * unless you specifically need random access to the row collection.
+     *
+     * <p>PDF format:
      * <pre>
      * "NAME","SIZE","ASSET COUNT","PATH",
      * "images",20.1 MB,3,"/content/dam/pxp/pxp/images",
@@ -394,11 +578,24 @@ public final class ReportsApiClient {
      *
      * <p>For maximum forward-compatibility we identify the column positions by HEADER NAME
      * (case-insensitive) rather than by fixed index, in case AEM ever reorders columns.
+     *
+     * <p><b>UTF-8 BOM handling:</b> AEM-Reports emits its CSV with a leading UTF-8 BOM
+     * ({@code U+FEFF}) at byte 0 of the body. Observed in Loki on 2026-05-17 author runs:
+     * the parser reported {@code headers=[\uFEFFNAME, SIZE, ASSET COUNT, PATH]} and failed
+     * the {@code "name".equals(h)} check because the first cell was actually
+     * {@code "\uFEFFname"}. We strip the BOM at the body level (covers the common case) AND
+     * defensively at the head of every parsed cell (covers exotic CSVs that might embed a
+     * BOM after a newline).
      */
     static List<ReportsApiRow> parseCsv(String csv) {
         List<ReportsApiRow> out = new ArrayList<>();
         if (csv == null || csv.isEmpty()) {
             return out;
+        }
+        // Strip UTF-8 BOM at the very start. AEM-Reports emits one; failing to strip it
+        // breaks the header-name match for the first column.
+        if (csv.charAt(0) == '\uFEFF') {
+            csv = csv.substring(1);
         }
         String[] lines = csv.split("\\r?\\n");
         if (lines.length < 1) {
@@ -410,7 +607,7 @@ public final class ReportsApiClient {
         int idxAssetCount = -1;
         int idxPath = -1;
         for (int i = 0; i < headers.length; i++) {
-            String h = headers[i].trim().toLowerCase(Locale.ROOT);
+            String h = stripBomAndTrim(headers[i]).toLowerCase(Locale.ROOT);
             if ("name".equals(h)) {
                 idxName = i;
             } else if ("size".equals(h)) {
@@ -436,13 +633,30 @@ public final class ReportsApiClient {
                 LOG.debug("[ReportsApiClient] parseCsv skipping short line[{}]: '{}'", i, line);
                 continue;
             }
-            String name = cells[idxName].trim();
-            String path = cells[idxPath].trim();
+            String name = stripBomAndTrim(cells[idxName]);
+            String path = stripBomAndTrim(cells[idxPath]);
             long sizeBytes = parseSizeBytes(cells[idxSize]);
             int assetCount = parseInt(cells[idxAssetCount]);
             out.add(new ReportsApiRow(name, sizeBytes, assetCount, path));
         }
         return out;
+    }
+
+    /**
+     * Trim whitespace AND strip a leading UTF-8 BOM ({@code U+FEFF}) if present. AEM-Reports
+     * occasionally embeds a BOM at the head of a cell — primarily the first cell of the
+     * first row — and a naïve {@code .trim()} does not remove it because
+     * {@link Character#isWhitespace(char)} returns false for {@code U+FEFF}.
+     */
+    static String stripBomAndTrim(String s) {
+        if (s == null) {
+            return "";
+        }
+        String t = s.trim();
+        if (!t.isEmpty() && t.charAt(0) == '\uFEFF') {
+            t = t.substring(1).trim();
+        }
+        return t;
     }
 
     /**

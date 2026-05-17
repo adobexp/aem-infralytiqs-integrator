@@ -800,6 +800,37 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
         }
     }
 
+    /**
+     * Live size of the in-memory backlog. {@link LinkedBlockingQueue#size()} is O(1) and weakly
+     * consistent, which is exactly what self-pacing producers need (they only care whether the
+     * backlog is "near full", not the exact count).
+     */
+    @Override
+    public int approximateBacklogSize() {
+        BlockingQueue<InfralytiqsAnalyticsPayload> q = queue;
+        return q == null ? -1 : q.size();
+    }
+
+    /**
+     * Total backlog capacity = current size + remaining capacity. Computed instead of stored
+     * because the queue is re-created on {@code @Modified} (line 220 / 279) with a different
+     * size; we never want to return a stale value.
+     */
+    @Override
+    public int approximateBacklogCapacity() {
+        BlockingQueue<InfralytiqsAnalyticsPayload> q = queue;
+        if (q == null) {
+            return -1;
+        }
+        int size = q.size();
+        int remaining = q.remainingCapacity();
+        // remainingCapacity is Integer.MAX_VALUE for unbounded queues; cap to avoid overflow.
+        if (remaining == Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return size + remaining;
+    }
+
     private void scheduledDrainKick() {
         InfralytiqsServiceCfg live = cfg;
 

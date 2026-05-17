@@ -11,6 +11,7 @@ import com.day.cq.replication.ReplicationEvent;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -304,38 +305,89 @@ public final class AssetPublishEventListener implements EventHandler {
             LOG.debug("[{}] received OSGi event #{} on topic='{}'", PID, observedNo, osgiEvent.getTopic());
         }
 
-        // Step 1 — extract the ReplicationAction from the event.
+        // Step 1 — extract action/user/time/paths from the event.
         //
-        // IMPORTANT: we do NOT use ReplicationEvent.fromEvent(osgiEvent) here even though that
-        // looks like the obvious tool for the job. fromEvent() is hard-coded to only accept
-        // events whose topic equals the compile-time ReplicationEvent.EVENT_TOPIC constant
-        // (which in this SDK resolves to com/adobe/granite/replication). On AEMaaCS production,
-        // the OSGi events that actually fire on author when a user clicks "Publish" use the
-        // legacy topic com/day/cq/replication — fromEvent() rejects those and silently returns
-        // null. That's exactly what we observed in Loki: 12 events received on
-        // com/day/cq/replication, all dropped with "returned null from ReplicationEvent.fromEvent".
+        // The replication event arrives in one of TWO shapes depending on the AEM version and
+        // the path that produced it. We handle both here:
         //
-        // The underlying event STILL carries the typed ReplicationAction in its "action"
-        // property regardless of topic — this is the de-facto Day CQ contract (the constant
-        // ReplicationEvent.PROPERTY_ACTION isn't exposed in every SDK build, so we hard-code
-        // the literal). Reading the property directly works for both topics and is
-        // forward-compatible.
+        // (a) LEGACY shape (older Day CQ replication agents):
+        //     event.getProperty("action") = a typed ReplicationAction object that wraps the
+        //     fields. ReplicationEvent.fromEvent(osgiEvent) is the documented accessor but it
+        //     rejects events whose topic doesn't match the SDK's EVENT_TOPIC constant — so we
+        //     read the property directly to make it topic-agnostic.
+        //
+        // (b) MODERN shape (AEMaaCS Sling-Distribution → ReplicationEvent enabler, observed
+        //     2026-05-17 on author p107366-e2062559):
+        //     NO "action" property at all. Instead the fields are at the top of the event:
+        //         type=String              ("Activate"/"Deactivate"/...)
+        //         userId=String
+        //         modificationDate=Calendar
+        //         paths=String[]
+        //         agentIds=List<String>
+        //     Confirmed in Loki: "Event property shape: modificationDate=GregorianCalendar;
+        //     agentIds=UnmodifiableRandomAccessList; type=String; userId=String;
+        //     paths=String[]; event.topics=String".
+        //
+        // The unified parser tries (a) first (cheap, single instanceof) then falls back to
+        // (b). If neither matches we log the property shape ONCE for diagnostics.
+        ReplicationActionType type;
+        String userId;
+        long timeMs;
+        String[] rawPaths;
+
         Object actionProp = osgiEvent.getProperty("action");
-        ReplicationAction action;
         if (actionProp instanceof ReplicationAction) {
-            action = (ReplicationAction) actionProp;
+            ReplicationAction action = (ReplicationAction) actionProp;
+            type = action.getType();
+            userId = action.getUserId();
+            timeMs = action.getTime();
+            rawPaths = action.getPaths();
         } else {
-            // Defensive: if the event has no "action" property, dump the property keys ONCE at
-            // INFO level so we can see the actual event shape in Loki and adapt. After the
-            // first miss the rate-limit silences the dump to avoid log spam.
-            action = null;
-            logUnknownEventShape(osgiEvent, observedNo);
-        }
-        if (action == null) {
-            return;
+            // Modern shape — read each field directly from event properties.
+            String typeStr = (String) osgiEvent.getProperty("type");
+            if (typeStr == null) {
+                logUnknownEventShape(osgiEvent, observedNo);
+                return;
+            }
+            type = ReplicationActionType.fromName(typeStr);
+            if (type == null) {
+                LOG.debug("[{}] event #{} type='{}' unparseable as ReplicationActionType — dropping",
+                        PID, observedNo, typeStr);
+                return;
+            }
+            userId = (String) osgiEvent.getProperty("userId");
+            Object modDateObj = osgiEvent.getProperty("modificationDate");
+            timeMs = (modDateObj instanceof Calendar)
+                    ? ((Calendar) modDateObj).getTimeInMillis()
+                    : System.currentTimeMillis();
+            Object pathsObj = osgiEvent.getProperty("paths");
+            if (pathsObj instanceof String[]) {
+                rawPaths = (String[]) pathsObj;
+            } else if (pathsObj instanceof String) {
+                rawPaths = new String[]{(String) pathsObj};
+            } else if (pathsObj instanceof List) {
+                List<?> list = (List<?>) pathsObj;
+                rawPaths = list.stream()
+                        .filter(Objects::nonNull)
+                        .map(Object::toString)
+                        .toArray(String[]::new);
+            } else {
+                rawPaths = null;
+            }
+            // Fallback: some agents fire with single-path "path" property instead of "paths"
+            if (rawPaths == null || rawPaths.length == 0) {
+                Object pathSingle = osgiEvent.getProperty("path");
+                if (pathSingle instanceof String) {
+                    rawPaths = new String[]{(String) pathSingle};
+                }
+            }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("[{}] event #{} modern-shape parsed — type='{}' user='{}' timeMs={} pathsCount={}",
+                        PID, observedNo, type.getName(), userId, timeMs,
+                        rawPaths == null ? 0 : rawPaths.length);
+            }
         }
 
-        ReplicationActionType type = action.getType();
         if (type == null) {
             LOG.debug("[{}] event #{} has no ReplicationActionType (dropping)", PID, observedNo);
             return;
@@ -359,7 +411,6 @@ public final class AssetPublishEventListener implements EventHandler {
             return;
         }
 
-        String[] rawPaths = action.getPaths();
         if (rawPaths == null || rawPaths.length == 0) {
             LOG.debug("[{}] event #{} type='{}' carries no paths (dropping)",
                     PID, observedNo, type.getName());
@@ -373,9 +424,6 @@ public final class AssetPublishEventListener implements EventHandler {
                     PID, observedNo, type.getName(), rawPaths.length);
             return;
         }
-
-        String userId = action.getUserId();
-        long timeMs = action.getTime();
         // Some replication agents leave time=0 when the action object is freshly synthesised
         // (e.g. dispatcher polls) — substitute the wall clock so the dimension stays parseable.
         if (timeMs <= 0L) {
@@ -461,10 +509,12 @@ public final class AssetPublishEventListener implements EventHandler {
     }
 
     /**
-     * One-shot diagnostic: when the event arrives without an "action" property we can't make
-     * progress, but we should at least log the property keys + topic so the operator can see
-     * the actual event shape in Loki. Guarded by {@link #unknownShapeLogged} so we don't spam
-     * the log if every event happens to be in an unexpected shape.
+     * One-shot diagnostic: the event arrives without any recognised shape (neither
+     * a typed {@code ReplicationAction} on the {@code "action"} property nor a top-level
+     * {@code "type"} string for the modern AEMaaCS shape). We log the property keys + topic
+     * once so the operator can see the exact event shape in Loki and ship a parser update.
+     * Guarded by {@link #unknownShapeLogged} so we don't spam the log if every event happens
+     * to be in an unexpected shape.
      */
     private void logUnknownEventShape(Event osgiEvent, long observedNo) {
         if (unknownShapeLogged.compareAndSet(false, true)) {
@@ -477,11 +527,11 @@ public final class AssetPublishEventListener implements EventHandler {
                     summary.append(k).append('=').append(cls).append("; ");
                 }
             }
-            LOG.warn("[{}] event #{} topic='{}' has no ReplicationAction in its 'action' property — "
-                    + "dropping. Event property shape (logged ONCE so we can adapt the parser): {}",
+            LOG.warn("[{}] event #{} topic='{}' has neither a typed ReplicationAction nor a 'type' "
+                    + "property — dropping. Event property shape (logged ONCE so we can adapt the parser): {}",
                     PID, observedNo, osgiEvent.getTopic(), summary.toString());
         } else if (LOG.isDebugEnabled()) {
-            LOG.debug("[{}] event #{} topic='{}' has no ReplicationAction — dropping (shape already logged)",
+            LOG.debug("[{}] event #{} topic='{}' has unknown shape — dropping (shape already logged)",
                     PID, observedNo, osgiEvent.getTopic());
         }
     }
