@@ -1,5 +1,6 @@
 package com.adobexp.infralytiqs.scheduler;
 
+import com.adobexp.infralytiqs.scheduler.internal.AemStorageUnits;
 import com.adobexp.infralytiqs.scheduler.internal.ReportsApiClient;
 import com.adobexp.infralytiqs.service.InfralytiqsAnalyticsPayload;
 import com.adobexp.infralytiqs.service.InfralytiqsService;
@@ -98,21 +99,21 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
  *   <tr><td>{@code report_root_path}</td><td>dimension</td><td>Configured root for this row</td></tr>
  *   <tr><td>{@code report_run_id}</td><td>dimension</td><td>UUID per run — pivot for "latest snapshot"</td></tr>
  *   <tr><td>{@code report_run_started_iso}</td><td>dimension</td><td>Run wall-clock start</td></tr>
- *   <tr><td>{@code size_bytes_cumulative}</td><td>metric</td><td>Bytes incl. subfolders (matches AEM CSV)</td></tr>
+ *   <tr><td>{@code size_mb_cumulative}</td><td>metric</td><td>Decimal MB incl. subfolders ({@code 1 GB=1000 MB})</td></tr>
  *   <tr><td>{@code asset_count_cumulative}</td><td>metric</td><td>Asset count incl. subfolders</td></tr>
- *   <tr><td>{@code size_bytes_self}</td><td>metric</td><td>Direct-child bytes only</td></tr>
+ *   <tr><td>{@code size_mb_self}</td><td>metric</td><td>Direct-child decimal MB only</td></tr>
  *   <tr><td>{@code asset_count_self}</td><td>metric</td><td>Direct-child asset count only</td></tr>
  * </table>
  *
  * <p><b>Drill-down query (ClickHouse):</b>
  * <pre>
- * SELECT folder_path, folder_name, size_bytes_cumulative, asset_count_cumulative
+ * SELECT folder_path, folder_name, size_mb_cumulative, asset_count_cumulative
  *   FROM events
  *  WHERE event_type = 'asset_disk_usage_report'
  *    AND folder_parent_path = '/content/dam/testdownload'
  *    AND report_run_id = (SELECT MAX(report_run_id)
  *                          FROM events WHERE event_type='asset_disk_usage_report')
- *  ORDER BY size_bytes_cumulative DESC;
+ *  ORDER BY size_mb_cumulative DESC;
  * </pre>
  *
  * <h2>Loki observability</h2>
@@ -603,7 +604,7 @@ public final class DamDiskUsageReportScheduler implements Runnable {
      * <p>Note that the per-row schema differs from JCR_WALK: AEM-Reports reports flat-list
      * folders (one row per folder under the tenant root) with pre-aggregated size + asset
      * count, not the JCR-walk's separate self/cumulative tally. We map AEM's "SIZE" →
-     * {@code size_bytes_cumulative} and "ASSET COUNT" → {@code asset_count_cumulative} so the
+     * {@code size_mb_cumulative} and "ASSET COUNT" → {@code asset_count_cumulative} so the
      * field names line up for ClickHouse cross-strategy reporting.
      */
     private void runReportsApiStrategy(DamDiskUsageReportCfg live, String runId, String startIso) {
@@ -770,12 +771,10 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         .dimension("report_strategy", "REPORTS_API")
                         .dimension("reports_api_job_title", trim(jobTitle, 256))
                         .dimension("reports_api_job_node_name", trim(jobNodeName, 256))
-                        // AEM-Reports SIZE = cumulative (whole subtree). It doesn't break out self vs
-                        // cumulative, so we report the cumulative value into both fields so cross-
-                        // strategy queries don't get NULLs.
-                        .metric("size_bytes_cumulative", (double) row.sizeBytes)
+                        // AEM-Reports SIZE → decimal MB (1 GB = 1000 MB) via AemStorageUnits.
+                        .metric(AemStorageUnits.METRIC_MB_CUMULATIVE, row.sizeMb)
                         .metric("asset_count_cumulative", (double) row.assetCount)
-                        .metric("size_bytes_self", (double) row.sizeBytes)
+                        .metric(AemStorageUnits.METRIC_MB_SELF, row.sizeMb)
                         .metric("asset_count_self", (double) row.assetCount)
                         .metric("folder_depth_metric", (double) depth);
 
@@ -783,8 +782,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         long n = emitCounter.incrementAndGet();
         if (LOG.isDebugEnabled()) {
-            LOG.debug("[{}] REPORTS_API emit folder='{}' depth={} bytes={} assets={} (#{} runId={})",
-                    PID, path, depth, row.sizeBytes, row.assetCount, n, runId);
+            LOG.debug("[{}] REPORTS_API emit folder='{}' depth={} sizeMb={} assets={} (#{} runId={})",
+                    PID, path, depth, row.sizeMb, row.assetCount, n, runId);
         }
         if (n % EMIT_SUMMARY_EVERY == 0) {
             int backlogSize = ingestPipeline.approximateBacklogSize();
@@ -908,6 +907,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
 
         long bytesCumul = s.bytesSelf + s.bytesCumulative;
         long assetsCumul = s.assetsSelf + s.assetsCumulative;
+        double mbCumul = AemStorageUnits.bytesToDecimalMegabytes(bytesCumul);
+        double mbSelf = AemStorageUnits.bytesToDecimalMegabytes(s.bytesSelf);
 
         InfralytiqsAnalyticsPayload.Builder b =
                 InfralytiqsAnalyticsPayload.builder("asset_disk_usage_report")
@@ -922,9 +923,9 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         .dimension("report_run_id", runId)
                         .dimension("report_run_started_iso", startIso)
                         .dimension("report_strategy", "JCR_WALK")
-                        .metric("size_bytes_cumulative", (double) bytesCumul)
+                        .metric(AemStorageUnits.METRIC_MB_CUMULATIVE, mbCumul)
                         .metric("asset_count_cumulative", (double) assetsCumul)
-                        .metric("size_bytes_self", (double) s.bytesSelf)
+                        .metric(AemStorageUnits.METRIC_MB_SELF, mbSelf)
                         .metric("asset_count_self", (double) s.assetsSelf)
                         .metric("folder_depth_metric", (double) frame.depth);
 
@@ -1013,7 +1014,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
     /**
      * Per-folder accumulators. {@code *Self} = direct asset children only; {@code *Cumulative} =
      * sum of all descendant sub-folder (self+cumulative) values. Emitted
-     * {@code size_bytes_cumulative} = self + cumulative so it matches AEM's CSV "SIZE column =
+     * {@code size_mb_cumulative} = decimal MB converted from JCR bytes so it matches AEM's CSV
+     * "SIZE column =
      * full subtree size" semantics.
      */
     static final class FolderStats {

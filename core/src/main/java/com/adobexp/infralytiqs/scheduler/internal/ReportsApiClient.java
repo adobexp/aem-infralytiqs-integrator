@@ -23,9 +23,6 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 /**
  * Encapsulates the four-step AEM "DAM Disk Usage Report" API flow as documented in
  * {@code GD-AEM Platform _ DAM Disk usage Reporting-170526-022710.pdf}.
@@ -43,7 +40,7 @@ import java.util.regex.Pattern;
  *       CSV. The CSV header is {@code "NAME","SIZE","ASSET COUNT","PATH"}. The {@code SIZE}
  *       column is pre-formatted as a human-readable string with a unit suffix
  *       ({@code "57.6 MB"}, {@code "1.2 GB"}); we convert back to raw bytes via
- *       {@link #parseSizeBytes(String)}.</li>
+ *       {@link AemStorageUnits#parseSizeToDecimalMegabytes(String)}.</li>
  *   <li>{@code DELETE /libs/dam/gui/content/reports/generatereport.export.json/<jobNodeName>}
  *       — best-effort cleanup to keep {@code /var/dam/reports} tidy. Failures are logged but
  *       don't abort the run, otherwise a transient delete error would mask the successfully
@@ -97,11 +94,6 @@ public final class ReportsApiClient {
     /** Fixed POST form-data values per the PDF (Section 6, Step 1). */
     static final String COLCONFIG = "/mnt/overlay/dam/gui/content/reports/steps/configurecolumns.html";
     static final String REPORT_TYPE = "foldersizeandstrengthreport";
-
-    /** Matches "57.6 MB" / "1.2 GB" / "512" — capture-group 1=number, 2=optional unit. */
-    private static final Pattern SIZE_RE =
-            Pattern.compile("^\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(B|KB|MB|GB|TB|PB)?\\s*$",
-                    Pattern.CASE_INSENSITIVE);
 
     private static final DateTimeFormatter JOB_TS_FORMAT =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
@@ -530,6 +522,7 @@ public final class ReportsApiClient {
             int maxIdx = Math.max(Math.max(idxName, idxSize), Math.max(idxAssetCount, idxPath));
             int emitted = 0;
             int lineNo = 0;
+            DamLevel1FolderRollup rollup = new DamLevel1FolderRollup();
             String line;
             while ((line = reader.readLine()) != null) {
                 lineNo++;
@@ -544,9 +537,19 @@ public final class ReportsApiClient {
                 }
                 String name = stripBomAndTrim(cells[idxName]);
                 String path = stripBomAndTrim(cells[idxPath]);
-                long sizeBytes = parseSizeBytes(cells[idxSize]);
+                double sizeMb = parseSizeMegabytes(cells[idxSize], path, lineNo);
                 int assetCount = parseInt(cells[idxAssetCount]);
-                emitter.emit(new ReportsApiRow(name, sizeBytes, assetCount, path),
+                rollup.onCsvRow(path, sizeMb, assetCount);
+                emitter.emit(new ReportsApiRow(name, sizeMb, assetCount, path),
+                        tenantRootPath, jobTitle, jobNodeName, runId, startIso);
+                rollup.markEmitted(path);
+                emitted++;
+            }
+            for (DamLevel1FolderRollup.RollupRow rollupRow : rollup.syntheticLevel1Rows()) {
+                LOG.info("[ReportsApiClient] emitting level-1 rollup row path='{}' sizeMb={} assets={} (runId={})",
+                        rollupRow.path, rollupRow.sizeMb, rollupRow.assetCount, runId);
+                emitter.emit(new ReportsApiRow(rollupRow.name, rollupRow.sizeMb, rollupRow.assetCount,
+                                rollupRow.path),
                         tenantRootPath, jobTitle, jobNodeName, runId, startIso);
                 emitted++;
             }
@@ -574,7 +577,7 @@ public final class ReportsApiClient {
      *
      * <p>The trailing comma on every line is part of the AEM CSV format. We tolerate both
      * quoted and unquoted fields and skip header / blank lines. The {@code SIZE} column is
-     * parsed via {@link #parseSizeBytes(String)}.
+     * parsed to decimal MB via {@link AemStorageUnits#parseSizeToDecimalMegabytes(String)}.
      *
      * <p>For maximum forward-compatibility we identify the column positions by HEADER NAME
      * (case-insensitive) rather than by fixed index, in case AEM ever reorders columns.
@@ -635,9 +638,9 @@ public final class ReportsApiClient {
             }
             String name = stripBomAndTrim(cells[idxName]);
             String path = stripBomAndTrim(cells[idxPath]);
-            long sizeBytes = parseSizeBytes(cells[idxSize]);
+            double sizeMb = parseSizeMegabytes(cells[idxSize], path, i);
             int assetCount = parseInt(cells[idxAssetCount]);
-            out.add(new ReportsApiRow(name, sizeBytes, assetCount, path));
+            out.add(new ReportsApiRow(name, sizeMb, assetCount, path));
         }
         return out;
     }
@@ -687,38 +690,20 @@ public final class ReportsApiClient {
     }
 
     /**
-     * Converts an AEM-Reports size string back to bytes. Examples:
-     * {@code "57.6 MB" → 60397977}, {@code "1.2 GB" → 1288490188}, {@code "512" → 512},
-     * {@code "20.1 MB" → 21076377}. Falls back to 0 on unparseable input.
-     *
-     * <p>AEM-Reports uses decimal (1000-based) units, NOT binary (1024-based). This is the
-     * convention you see in the file browser column ({@code KB / MB / GB}). We follow the
-     * same convention so the reported numbers match the AEM UI exactly.
+     * Converts an AEM-Reports {@code SIZE} cell to decimal megabytes ({@code 1 GB → 1000 MB}).
      */
-    static long parseSizeBytes(String raw) {
-        if (raw == null) {
-            return 0L;
+    static double parseSizeMegabytes(String raw) {
+        return parseSizeMegabytes(raw, null, -1);
+    }
+
+    static double parseSizeMegabytes(String raw, String folderPath, int lineNo) {
+        double sizeMb = AemStorageUnits.parseSizeToDecimalMegabytes(raw);
+        if (sizeMb == 0d && raw != null && !raw.trim().isEmpty()
+                && !AemReportsSizeParser.parse(raw).parsed) {
+            LOG.warn("[ReportsApiClient] could not parse SIZE='{}' path='{}' line={} — storing 0 MB",
+                    truncate(raw, 64), folderPath, lineNo);
         }
-        Matcher m = SIZE_RE.matcher(raw.replace("\"", ""));
-        if (!m.matches()) {
-            return 0L;
-        }
-        double v = Double.parseDouble(m.group(1));
-        String unit = m.group(2);
-        if (unit == null) {
-            return Math.round(v);
-        }
-        long mult;
-        switch (unit.toUpperCase(Locale.ROOT)) {
-            case "B":  mult = 1L; break;
-            case "KB": mult = 1_000L; break;
-            case "MB": mult = 1_000_000L; break;
-            case "GB": mult = 1_000_000_000L; break;
-            case "TB": mult = 1_000_000_000_000L; break;
-            case "PB": mult = 1_000_000_000_000_000L; break;
-            default:   mult = 1L;
-        }
-        return Math.round(v * mult);
+        return sizeMb;
     }
 
     private static int parseInt(String raw) {
@@ -784,16 +769,16 @@ public final class ReportsApiClient {
         }
     }
 
-    /** One parsed CSV row — direct mirror of an AEM-Reports CSV line. */
+    /** One parsed CSV row — direct mirror of an AEM-Reports CSV line (size in decimal MB). */
     public static final class ReportsApiRow {
         public final String name;
-        public final long sizeBytes;
+        public final double sizeMb;
         public final int assetCount;
         public final String path;
 
-        public ReportsApiRow(String name, long sizeBytes, int assetCount, String path) {
+        public ReportsApiRow(String name, double sizeMb, int assetCount, String path) {
             this.name = name;
-            this.sizeBytes = sizeBytes;
+            this.sizeMb = sizeMb;
             this.assetCount = assetCount;
             this.path = path;
         }
