@@ -21,8 +21,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 /**
  * Encapsulates the four-step AEM "DAM Disk Usage Report" API flow as documented in
  * {@code GD-AEM Platform _ DAM Disk usage Reporting-170526-022710.pdf}.
@@ -291,25 +293,31 @@ public final class ReportsApiClient {
      * tells AEM to start the job immediately rather than registering a Quartz trigger.
      */
     String createJob(String tenantPath, String jobTitle) {
-        String body = formEncode(
-                "colconfig", COLCONFIG,
-                "dam-asset-report-type", REPORT_TYPE,
-                "jobTitle", jobTitle,
-                "jobDescription", "Infralytiqs-generated DAM disk usage report",
-                "path", tenantPath,
-                "renditionsize", "on",
-                "reportSchedule", "now",
-                "reportdesc", "Infralytiqs disk usage report for " + tenantPath,
-                "reporticon", "fileSpace",
-                "reporttype", REPORT_TYPE);
+        String normalizedPath = normalizeTenantPath(tenantPath);
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("colconfig", COLCONFIG);
+        fields.put("dam-asset-report-type", REPORT_TYPE);
+        fields.put("jobTitle", jobTitle);
+        fields.put("jobDescription", "Infralytiqs-generated DAM disk usage report");
+        fields.put("path", normalizedPath);
+        fields.put("renditionsize", "on");
+        fields.put("reportSchedule", "now");
+        fields.put("reportdesc", "Infralytiqs disk usage report for " + normalizedPath);
+        fields.put("reporticon", "fileSpace");
+        fields.put("reporttype", REPORT_TYPE);
+
+        String boundary = "----InfralytiqsReportsApi" + Long.toHexString(System.nanoTime());
+        byte[] body = buildMultipartFormBody(fields, boundary);
+        LOG.info("[ReportsApiClient] STEP 1 createJob POST path='{}' jobTitle='{}' contentType=multipart/form-data",
+                normalizedPath, jobTitle);
 
         HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/libs/dam/gui/content/reports/generatereport.export.json"))
                 .timeout(STEP_124_HTTP_TIMEOUT)
                 .header("Authorization", basicAuthHeader)
-                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
                 .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                 .build());
 
         if (resp.statusCode() != 200 && resp.statusCode() != 201) {
@@ -717,19 +725,46 @@ public final class ReportsApiClient {
         }
     }
 
-    /** Build an {@code application/x-www-form-urlencoded} body from alternating key/value args. */
-    private static String formEncode(String... kv) {
-        if (kv.length % 2 != 0) {
-            throw new IllegalArgumentException("formEncode needs even number of args");
+    /**
+     * Normalises a tenant DAM root before POSTing to AEM. Trims whitespace and rejects values
+     * that are not absolute JCR paths.
+     */
+    static String normalizeTenantPath(String tenantPath) {
+        if (tenantPath == null) {
+            return "";
         }
+        String trimmed = tenantPath.trim();
+        return trimmed.startsWith("/") ? trimmed : "";
+    }
+
+    /**
+     * Builds {@code multipart/form-data} exactly as the AEM Touch UI / Postman flow does.
+     * The {@code path} part is sent with literal {@code /} characters (not {@code %2F}) so the
+     * generatereport servlet scopes the job to the configured tenant folder instead of falling
+     * back to {@code /content/dam}.
+     */
+    static byte[] buildMultipartFormBody(Map<String, String> fields, String boundary) {
+        String crlf = "\r\n";
         StringBuilder b = new StringBuilder();
-        for (int i = 0; i < kv.length; i += 2) {
-            if (b.length() > 0) {
-                b.append('&');
-            }
-            b.append(urlEncode(kv[i])).append('=').append(urlEncode(kv[i + 1]));
+        for (Map.Entry<String, String> field : fields.entrySet()) {
+            b.append("--").append(boundary).append(crlf);
+            b.append("Content-Disposition: form-data; name=\"")
+                    .append(field.getKey())
+                    .append('"')
+                    .append(crlf)
+                    .append(crlf);
+            b.append(field.getValue() == null ? "" : field.getValue()).append(crlf);
         }
-        return b.toString();
+        b.append("--").append(boundary).append("--").append(crlf);
+        return b.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** Package-private for unit tests — returns the {@code path} field from a create-job form. */
+    static String pathFieldForCreateJob(String tenantPath, String jobTitle) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("path", normalizeTenantPath(tenantPath));
+        fields.put("jobTitle", jobTitle);
+        return fields.get("path");
     }
 
     private static String urlEncode(String s) {
