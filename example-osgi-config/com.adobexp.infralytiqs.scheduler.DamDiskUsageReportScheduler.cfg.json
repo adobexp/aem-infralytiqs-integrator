@@ -28,5 +28,6 @@
   "reportsApiPollTimeoutSec": 43200,
   "reportsApiDownloadTimeoutSec": 600,
   "reportsApiEmitPacingMaxFillRatio": 0.75,
-  "reportsApiEmitPacingMaxWaitMs": 30000
+  "reportsApiEmitPacingMaxWaitMs": 30000,
+  "reportsApiDeleteJobAfterSuccess": false
 }

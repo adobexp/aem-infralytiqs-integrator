@@ -21,10 +21,8 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 /**
  * Encapsulates the four-step AEM "DAM Disk Usage Report" API flow as documented in
  * {@code GD-AEM Platform _ DAM Disk usage Reporting-170526-022710.pdf}.
@@ -114,6 +112,7 @@ public final class ReportsApiClient {
     private final int pollIntervalSec;
     private final int pollTimeoutSec;
     private final Duration downloadTimeout;
+    private final boolean deleteJobAfterSuccess;
     private final ObjectMapper json = new ObjectMapper();
 
     /**
@@ -137,9 +136,14 @@ public final class ReportsApiClient {
      *                            (they are tiny JSON requests over loopback). 600 s (10 min)
      *                            is the default and covers CSVs up to ~100 MB on a loopback
      *                            link under load.
+     * @param deleteJobAfterSuccess when true, STEP 4 DELETE runs only after the job completed,
+     *                              CSV was downloaded, and at least one row was emitted; when
+     *                              false (default), report nodes are kept under
+     *                              {@code /var/dam/reports} for inspection.
      */
     public ReportsApiClient(String baseUrl, String username, String password,
-            int pollIntervalSec, int pollTimeoutSec, int downloadTimeoutSec) {
+            int pollIntervalSec, int pollTimeoutSec, int downloadTimeoutSec,
+            boolean deleteJobAfterSuccess) {
         this.baseUrl = baseUrl == null ? "" : baseUrl.replaceAll("/+$", "");
         String credentials = (username == null ? "" : username) + ":" + (password == null ? "" : password);
         this.basicAuthHeader = "Basic " + Base64.getEncoder()
@@ -147,6 +151,7 @@ public final class ReportsApiClient {
         this.pollIntervalSec = Math.max(1, pollIntervalSec);
         this.pollTimeoutSec = Math.max(pollIntervalSec, pollTimeoutSec);
         this.downloadTimeout = Duration.ofSeconds(Math.max(60, downloadTimeoutSec));
+        this.deleteJobAfterSuccess = deleteJobAfterSuccess;
     }
 
     /** Outcome of STEP 2 — three-valued so callers can react differently. */
@@ -158,15 +163,14 @@ public final class ReportsApiClient {
          *  it. Operator must manually delete the orphan node from {@code /var/dam/reports}
          *  when the job eventually finishes (or fails). */
         TIMED_OUT,
-        /** {@code jobStatus=failed} / {@code error} observed, or polling was interrupted.
-         *  STEP 4 cleanup STILL runs (the AEM job is terminal-non-success). */
+        /** {@code jobStatus=failed} / {@code error} observed, or polling was interrupted. */
         FAILED
     }
 
     /**
      * Runs the full four-step flow against a single tenant root. Emits one row per CSV line
-     * via {@code emitter} (excluding the header). Cleanup always runs even when steps 2 or 3
-     * fail.
+     * via {@code emitter} (excluding the header). STEP 4 cleanup is optional — see
+     * {@link #deleteJobAfterSuccess}.
      *
      * @return number of CSV rows successfully emitted (0 if any step before emission failed).
      */
@@ -233,21 +237,23 @@ public final class ReportsApiClient {
             LOG.error("[ReportsApiClient] flow FAILED tenant='{}' jobNodeName='{}' (runId={}): {}",
                     tenantRootPath, jobNodeName, runId, ex.toString(), ex);
         } finally {
-            // STEP 4 cleanup — but ONLY when the job reached a terminal AEM-side state
-            // (COMPLETED or FAILED). On TIMED_OUT the job may still be running; deleting its
-            // node would cancel AEM's in-flight work and leave temp artifacts under
-            // /var/dam/temp. The operator can either DELETE manually after AEM finishes, or
-            // configure /var/dam/reports cleanup to run separately.
-            if (jobNodeName != null && pollResult != PollResult.TIMED_OUT) {
+            if (jobNodeName != null && !deleteJobAfterSuccess) {
+                LOG.info("[ReportsApiClient] STEP 4 cleanup SKIPPED — deleteJobAfterSuccess=false, "
+                        + "job preserved at /var/dam/reports/{} (runId={})", jobNodeName, runId);
+            } else if (jobNodeName != null && pollResult == PollResult.TIMED_OUT) {
+                LOG.warn("[ReportsApiClient] STEP 4 cleanup SKIPPED (poll TIMED_OUT) — job preserved "
+                        + "at /var/dam/reports/{} until AEM finishes (runId={})", jobNodeName, runId);
+            } else if (jobNodeName != null && pollResult == PollResult.COMPLETED && emitted > 0) {
                 try {
-                    LOG.info("[ReportsApiClient] STEP 4 cleanup tenant='{}' jobNodeName='{}' pollResult={} (runId={})",
-                            tenantRootPath, jobNodeName, pollResult, runId);
+                    LOG.info("[ReportsApiClient] STEP 4 cleanup tenant='{}' jobNodeName='{}' rowsEmitted={} (runId={})",
+                            tenantRootPath, jobNodeName, emitted, runId);
                     boolean ok = deleteJob(jobNodeName);
                     if (ok) {
                         LOG.info("[ReportsApiClient] STEP 4 cleanup OK tenant='{}' jobNodeName='{}' (runId={})",
                                 tenantRootPath, jobNodeName, runId);
                     } else {
-                        LOG.warn("[ReportsApiClient] STEP 4 cleanup FAILED tenant='{}' jobNodeName='{}' — manual cleanup may be needed in /var/dam/reports (runId={})",
+                        LOG.warn("[ReportsApiClient] STEP 4 cleanup FAILED tenant='{}' jobNodeName='{}' — "
+                                + "manual cleanup may be needed in /var/dam/reports (runId={})",
                                 tenantRootPath, jobNodeName, runId);
                     }
                 } catch (RuntimeException ex) {
@@ -255,8 +261,9 @@ public final class ReportsApiClient {
                             tenantRootPath, jobNodeName, runId, ex.toString());
                 }
             } else if (jobNodeName != null) {
-                LOG.warn("[ReportsApiClient] STEP 4 cleanup SKIPPED (poll TIMED_OUT) — orphan node /var/dam/reports/{} requires manual cleanup once AEM finishes (runId={})",
-                        jobNodeName, runId);
+                LOG.warn("[ReportsApiClient] STEP 4 cleanup SKIPPED — job not fully successful "
+                        + "(pollResult={}, rowsEmitted={}), preserved at /var/dam/reports/{} (runId={})",
+                        pollResult, emitted, jobNodeName, runId);
             }
         }
 
@@ -268,21 +275,36 @@ public final class ReportsApiClient {
 
     /**
      * Generates a job title matching the PDF's convention:
-     * {@code <tenantSlug>-DiskUsage-<yyyyMMdd>-<HHmmss>}, e.g.
-     * {@code testdownload-DiskUsage-20260517-024834}. The title doubles as the CSV filename
-     * (per the PDF Section 6 Step 3) so it must be filesystem-safe — we only allow
-     * {@code [A-Za-z0-9._-]}.
+     * {@code <folderName>-DiskUsage-<yyyyMMdd>-<HHmmss>}, e.g.
+     * {@code garnier-DiskUsage-20260517-024834} for {@code /content/dam/garnier} and
+     * {@code arc-DiskUsage-...} for {@code /content/dam/px/arc}. Uses the last path segment
+     * (the folder name at the configured tenant root). The title doubles as the CSV filename
+     * (per the PDF Section 6 Step 3) so it must be filesystem-safe.
      */
     static String generateJobTitle(String tenantPath) {
-        String slug = tenantPath == null ? "tenant" : tenantPath.replaceFirst("^/content/dam/?", "");
-        if (slug.isEmpty()) {
-            slug = "root";
+        String folderName = folderNameFromTenantPath(tenantPath);
+        return folderName + "-DiskUsage-" + LocalDateTime.now().format(JOB_TS_FORMAT);
+    }
+
+    /**
+     * Last JCR path segment for {@code tenantPath}, e.g. {@code garnier} for
+     * {@code /content/dam/garnier}, {@code arc} for {@code /content/dam/px/arc}.
+     */
+    static String folderNameFromTenantPath(String tenantPath) {
+        if (tenantPath == null || tenantPath.isEmpty()) {
+            return "tenant";
         }
-        slug = slug.replaceAll("[^A-Za-z0-9._-]", "_");
-        if (slug.length() > 60) {
-            slug = slug.substring(0, 60);
+        String trimmed = tenantPath.trim();
+        if (trimmed.equals("/content/dam") || trimmed.equals("/content/dam/")) {
+            return "dam";
         }
-        return slug + "-Infralytiqs-DiskUsage-" + LocalDateTime.now().format(JOB_TS_FORMAT);
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        int idx = trimmed.lastIndexOf('/');
+        String name = idx < 0 ? trimmed : trimmed.substring(idx + 1);
+        name = name.replaceAll("[^A-Za-z0-9._-]", "_");
+        return name.isEmpty() ? "tenant" : name;
     }
 
     /**
@@ -293,31 +315,25 @@ public final class ReportsApiClient {
      * tells AEM to start the job immediately rather than registering a Quartz trigger.
      */
     String createJob(String tenantPath, String jobTitle) {
-        String normalizedPath = normalizeTenantPath(tenantPath);
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("colconfig", COLCONFIG);
-        fields.put("dam-asset-report-type", REPORT_TYPE);
-        fields.put("jobTitle", jobTitle);
-        fields.put("jobDescription", "Infralytiqs-generated DAM disk usage report");
-        fields.put("path", normalizedPath);
-        fields.put("renditionsize", "on");
-        fields.put("reportSchedule", "now");
-        fields.put("reportdesc", "Infralytiqs disk usage report for " + normalizedPath);
-        fields.put("reporticon", "fileSpace");
-        fields.put("reporttype", REPORT_TYPE);
-
-        String boundary = "----InfralytiqsReportsApi" + Long.toHexString(System.nanoTime());
-        byte[] body = buildMultipartFormBody(fields, boundary);
-        LOG.info("[ReportsApiClient] STEP 1 createJob POST path='{}' jobTitle='{}' contentType=multipart/form-data",
-                normalizedPath, jobTitle);
+        String body = formEncode(
+                "colconfig", COLCONFIG,
+                "dam-asset-report-type", REPORT_TYPE,
+                "jobTitle", jobTitle,
+                "jobDescription", "Infralytiqs-generated DAM disk usage report",
+                "path", tenantPath,
+                "renditionsize", "on",
+                "reportSchedule", "now",
+                "reportdesc", "Infralytiqs disk usage report for " + tenantPath,
+                "reporticon", "fileSpace",
+                "reporttype", REPORT_TYPE);
 
         HttpResponse<String> resp = exec(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/libs/dam/gui/content/reports/generatereport.export.json"))
                 .timeout(STEP_124_HTTP_TIMEOUT)
                 .header("Authorization", basicAuthHeader)
-                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build());
 
         if (resp.statusCode() != 200 && resp.statusCode() != 201) {
@@ -725,46 +741,19 @@ public final class ReportsApiClient {
         }
     }
 
-    /**
-     * Normalises a tenant DAM root before POSTing to AEM. Trims whitespace and rejects values
-     * that are not absolute JCR paths.
-     */
-    static String normalizeTenantPath(String tenantPath) {
-        if (tenantPath == null) {
-            return "";
+    /** Build an {@code application/x-www-form-urlencoded} body from alternating key/value args. */
+    private static String formEncode(String... kv) {
+        if (kv.length % 2 != 0) {
+            throw new IllegalArgumentException("formEncode needs even number of args");
         }
-        String trimmed = tenantPath.trim();
-        return trimmed.startsWith("/") ? trimmed : "";
-    }
-
-    /**
-     * Builds {@code multipart/form-data} exactly as the AEM Touch UI / Postman flow does.
-     * The {@code path} part is sent with literal {@code /} characters (not {@code %2F}) so the
-     * generatereport servlet scopes the job to the configured tenant folder instead of falling
-     * back to {@code /content/dam}.
-     */
-    static byte[] buildMultipartFormBody(Map<String, String> fields, String boundary) {
-        String crlf = "\r\n";
         StringBuilder b = new StringBuilder();
-        for (Map.Entry<String, String> field : fields.entrySet()) {
-            b.append("--").append(boundary).append(crlf);
-            b.append("Content-Disposition: form-data; name=\"")
-                    .append(field.getKey())
-                    .append('"')
-                    .append(crlf)
-                    .append(crlf);
-            b.append(field.getValue() == null ? "" : field.getValue()).append(crlf);
+        for (int i = 0; i < kv.length; i += 2) {
+            if (b.length() > 0) {
+                b.append('&');
+            }
+            b.append(urlEncode(kv[i])).append('=').append(urlEncode(kv[i + 1]));
         }
-        b.append("--").append(boundary).append("--").append(crlf);
-        return b.toString().getBytes(StandardCharsets.UTF_8);
-    }
-
-    /** Package-private for unit tests — returns the {@code path} field from a create-job form. */
-    static String pathFieldForCreateJob(String tenantPath, String jobTitle) {
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("path", normalizeTenantPath(tenantPath));
-        fields.put("jobTitle", jobTitle);
-        return fields.get("path");
+        return b.toString();
     }
 
     private static String urlEncode(String s) {

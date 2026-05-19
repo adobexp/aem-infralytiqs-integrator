@@ -10,7 +10,6 @@ import com.day.cq.dam.api.Asset;
 import com.day.cq.dam.api.Rendition;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -366,6 +365,15 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                         + "'pacing wait exceeded' warnings and the underlying ClickHouse HTTP "
                         + "pipeline is slow.")
         long reportsApiEmitPacingMaxWaitMs() default 30_000L;
+
+        @AttributeDefinition(
+                name = "Reports API: delete job after success",
+                description = "STEP 4 cleanup (DELETE under /var/dam/reports). Default false keeps "
+                        + "each report job node for inspection while the pipeline is being validated. "
+                        + "When true, deletes only after AEM reports completed, the CSV was downloaded, "
+                        + "and at least one row was emitted. Jobs that time out, fail, or emit zero rows "
+                        + "are never deleted.")
+        boolean reportsApiDeleteJobAfterSuccess() default false;
     }
 
     /** Strategy switch for {@link DamDiskUsageReportCfg#mode()}. */
@@ -411,13 +419,13 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                 c.runOnActivate());
         // Log REPORTS_API config separately to keep the primary banner readable. Password is
         // intentionally only echoed as <set>/<unset> — never logged in clear.
-        LOG.info("[{}] activate — REPORTS_API reportsApiBaseUrl='{}' reportsApiUsername='{}' reportsApiPasswordPresent={} reportsApiTenantPaths={} pollIntervalSec={} pollTimeoutSec={} downloadTimeoutSec={} emitPacingMaxFillRatio={} emitPacingMaxWaitMs={}",
+        LOG.info("[{}] activate — REPORTS_API reportsApiBaseUrl='{}' reportsApiUsername='{}' reportsApiPasswordPresent={} reportsApiTenantPaths={} pollIntervalSec={} pollTimeoutSec={} downloadTimeoutSec={} emitPacingMaxFillRatio={} emitPacingMaxWaitMs={} deleteJobAfterSuccess={}",
                 PID, c.reportsApiBaseUrl(), c.reportsApiUsername(),
                 c.reportsApiPassword() != null && !c.reportsApiPassword().isEmpty(),
                 Arrays.toString(c.reportsApiTenantPaths()),
                 c.reportsApiPollIntervalSec(), c.reportsApiPollTimeoutSec(),
                 c.reportsApiDownloadTimeoutSec(), c.reportsApiEmitPacingMaxFillRatio(),
-                c.reportsApiEmitPacingMaxWaitMs());
+                c.reportsApiEmitPacingMaxWaitMs(), c.reportsApiDeleteJobAfterSuccess());
 
         applySchedule(c);
 
@@ -618,16 +626,11 @@ public final class DamDiskUsageReportScheduler implements Runnable {
             return;
         }
 
-        String[] tenants = resolveReportsApiTenantPaths(live);
-        if (tenants.length == 0) {
-            LOG.error("[{}] REPORTS_API strategy SKIPPED — no valid tenant paths in "
-                    + "reportsApiTenantPaths or reportRootPaths (runId={})", PID, runId);
-            return;
-        }
-        LOG.info("[{}] REPORTS_API strategy STARTED — runId={} baseUrl='{}' username='{}' tenants={} pollIntervalSec={} pollTimeoutSec={}",
+        String[] tenants = live.reportsApiTenantPaths();
+        LOG.info("[{}] REPORTS_API strategy STARTED — runId={} baseUrl='{}' username='{}' tenants={} pollIntervalSec={} pollTimeoutSec={} deleteJobAfterSuccess={}",
                 PID, runId, live.reportsApiBaseUrl(), live.reportsApiUsername(),
                 Arrays.toString(tenants), live.reportsApiPollIntervalSec(),
-                live.reportsApiPollTimeoutSec());
+                live.reportsApiPollTimeoutSec(), live.reportsApiDeleteJobAfterSuccess());
 
         ReportsApiClient client = new ReportsApiClient(
                 live.reportsApiBaseUrl(),
@@ -635,7 +638,8 @@ public final class DamDiskUsageReportScheduler implements Runnable {
                 live.reportsApiPassword(),
                 live.reportsApiPollIntervalSec(),
                 live.reportsApiPollTimeoutSec(),
-                live.reportsApiDownloadTimeoutSec());
+                live.reportsApiDownloadTimeoutSec(),
+                live.reportsApiDeleteJobAfterSuccess());
 
         // Per-emit counters shared with the emit callback for periodic INFO summaries (every
         // 5 000 rows by default, to avoid 200 000 per-row INFO lines flooding Loki). The skip
@@ -807,51 +811,6 @@ public final class DamDiskUsageReportScheduler implements Runnable {
      * {@code /content/dam} → 1; {@code /content/dam/foo/bar} → 2. Returns 0 when {@code path}
      * equals {@code rootPath} or doesn't start with it.
      */
-    /**
-     * Resolves DAM roots for {@code REPORTS_API}. Uses {@link DamDiskUsageReportCfg#reportsApiTenantPaths()}
-     * first; when that is empty, falls back to {@link DamDiskUsageReportCfg#reportRootPaths()} so a
-     * mis-copy between the two arrays does not silently scope every job to {@code /content/dam}.
-     * Each entry is trimmed; comma-separated strings (common when env vars collapse arrays) are split.
-     */
-    static String[] resolveReportsApiTenantPaths(DamDiskUsageReportCfg cfg) {
-        List<String> paths = normalizeDamPathList(cfg.reportsApiTenantPaths());
-        if (paths.isEmpty()) {
-            paths = normalizeDamPathList(cfg.reportRootPaths());
-            if (!paths.isEmpty()) {
-                LOG.warn("[{}] reportsApiTenantPaths is empty — using reportRootPaths for REPORTS_API: {}",
-                        PID, paths);
-            }
-        }
-        return paths.toArray(new String[0]);
-    }
-
-    static List<String> normalizeDamPathList(String[] raw) {
-        List<String> out = new ArrayList<>();
-        if (raw == null) {
-            return out;
-        }
-        for (String entry : raw) {
-            if (entry == null || entry.isEmpty()) {
-                continue;
-            }
-            String[] parts = entry.indexOf(',') >= 0 ? entry.split(",") : new String[] {entry};
-            for (String part : parts) {
-                String path = part == null ? "" : part.trim();
-                if (path.isEmpty()) {
-                    continue;
-                }
-                if (!path.startsWith("/")) {
-                    LOG.warn("[{}] skipping invalid DAM path (must start with /): '{}'", PID, path);
-                    continue;
-                }
-                if (!out.contains(path)) {
-                    out.add(path);
-                }
-            }
-        }
-        return out;
-    }
-
     static int computeDepth(String rootPath, String path) {
         if (rootPath == null || path == null) {
             return 0;
