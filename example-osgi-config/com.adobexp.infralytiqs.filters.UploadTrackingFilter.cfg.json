@@ -1,0 +1,8 @@
+{
+  "marker": "infralytiqs-upload-tracking-enabled",
+  "patterns": [
+    "name=pattern_1_complete_upload;subtype=post_complete_upload_status_200;url_suffix=.completeUpload.json;method=POST;status=200;extract_path_from_url=true;file_name_form_param=fileName;query_params_required=fileName;query_param_dimensions=mimeType:upload_mime_type;query_param_metrics=fileSize:upload_size_bytes,uploadDuration:upload_duration_ms;priority=1",
+    "name=pattern_2_initiate_upload;subtype=post_initiate_upload_status_200;url_suffix=.initiateUpload.json;method=POST;status=200;extract_path_from_url=true;query_params_required=path;query_param_dimensions=path:upload_batch_path;multi_param_count_metrics=fileName:upload_batch_file_count;multi_param_sum_metrics=fileSize:upload_batch_total_bytes;priority=2",
+    "name=pattern_3_name_conflicts;subtype=post_name_conflicts_status_200;url_suffix=.nameconflicts.json;method=POST;status=200;extract_path_from_url=true;priority=3"
+  ]
+}

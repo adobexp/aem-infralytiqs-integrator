@@ -3,5 +3,9 @@
   "tenantId": "groupe-dam",
   "siteId": "DEV",
   "dbName": "PublicisDB",
-  "analyticsServerUrl": "http://localhost:8080"
+  "analyticsServerUrl": "http://localhost:8080",
+  "infralytiqsClientBootstrapLibs": [
+    "psassets.publicissapient.com:/cl/publicis/ps/infralytiqs-bootstrap.min.js",
+    "askthelion.info:/cl/publicis/atl/infralytiqs-bootstrap.min.js"
+  ]
 }
