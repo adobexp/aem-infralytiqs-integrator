@@ -1,8 +1,6 @@
 {
   "scripts": [
     "create service user infralytiqs-dam-reporter with path system/cq:services/infralytiqs",
-    "set ACL for infralytiqs-dam-reporter",
-    "    allow jcr:read on /content/dam",
-    "end"
+    "set ACL for infralytiqs-dam-reporter\n    allow jcr:read on /content/dam\nend"
   ]
 }
