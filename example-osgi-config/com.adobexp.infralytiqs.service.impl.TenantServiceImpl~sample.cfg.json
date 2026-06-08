@@ -4,6 +4,9 @@
   "siteId": "example-site-id",
   "dbName": "PublicisDB",
   "analyticsServerUrl": "http://localhost:8080",
+  "companyId": "REPLACE_WITH_IL_COMPANY_ID",
+  "clientKey": "REPLACE_WITH_IL_TENANT_CLIENT_KEY",
+  "clientSecret": "REPLACE_WITH_IL_TENANT_CLIENT_SECRET",
   "infralytiqsClientBootstrapLibs": [
     "psassets.publicissapient.com:/cl/publicis/ps/infralytiqs-bootstrap.min.js",
     "askthelion.info:/cl/publicis/atl/infralytiqs-bootstrap.min.js"
