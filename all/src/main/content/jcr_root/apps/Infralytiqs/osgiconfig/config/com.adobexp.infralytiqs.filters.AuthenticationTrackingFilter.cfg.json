@@ -1,9 +1,9 @@
 {
   "marker": "infralytiqs-authentication-tracking-enabled",
   "patterns": [
-    "name=pattern_1_saml_login;subtype=post_saml_response_redirect_status_302;url_suffix=/saml_login;method=POST;status=redirect;response_cookie=login-token;body_contains=SAMLResponse=;priority=1",
+    "name=pattern_1_saml_login;subtype=post_saml_response_redirect_status_302;url_suffix=/saml_login;method=POST;status=redirect;response_cookie=login-token;priority=1",
     "name=pattern_2_oidc_fragment;subtype=get_oauth_exchange_redirect_status_302;url_suffix=/j_security_check;method=GET;status=redirect;response_cookie=login-token;query_params=code;priority=2",
-    "name=pattern_3_basic_form;subtype=post_basic_credentials_status_200;url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token;form_params=j_username,j_password;priority=3",
+    "name=pattern_3_basic_form;subtype=post_basic_credentials_status_200;url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token;priority=3",
     "name=pattern_4_saml_login_redirect_get;subtype=get_saml_redirect_status_302;url_suffix=/saml_login;method=GET;status=redirect;response_cookie=login-token;priority=4",
     "name=pattern_5_sling_logout;subtype=logout_via_sling;event_type=logout;url_suffix=/system/sling/logout;method=GET;status=redirect,200;response_cookie=login-token;priority=5",
     "name=pattern_6_sling_logout_html;subtype=logout_via_sling_html;event_type=logout;url_suffix=/system/sling/logout.html;method=GET;status=redirect,200;response_cookie=login-token;priority=6"

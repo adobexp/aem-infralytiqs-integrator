@@ -92,17 +92,27 @@ public final class AuthenticationTrackingFilter implements Filter {
 
     private static final String DEFAULT_LOGIN_COOKIE = "login-token";
 
-    /** Verbatim defaults reproducing the original Pattern 1 / 2 / 3. */
+    /**
+     * Verbatim defaults reproducing Pattern 1 / 2 / 3.
+     *
+     * <p>Auth POST endpoints ({@code /saml_login}, {@code /j_security_check}) are matched purely
+     * from response-side signals (method + URL suffix + redirect/200 status + {@code login-token}
+     * cookie). They deliberately do NOT use {@code body_contains} / {@code form_params}, because
+     * those keys force this whiteboard filter to read and re-parse the request body BEFORE AEM's
+     * authentication handlers run — which shadows the servlet container's native parameter parsing
+     * of {@code SAMLResponse} / {@code j_username} / {@code j_password} and can break SAML and form
+     * login. The response-side signals are already a unique fingerprint for a successful login.
+     */
     private static final String[] DEFAULT_PATTERNS = {
             "name=pattern_1_saml_login;subtype=post_saml_response_redirect_status_302"
                     + ";url_suffix=/saml_login;method=POST;status=redirect;response_cookie=login-token"
-                    + ";body_contains=SAMLResponse=;priority=1",
+                    + ";priority=1",
             "name=pattern_2_oidc_fragment;subtype=get_oauth_exchange_redirect_status_302"
                     + ";url_suffix=/j_security_check;method=GET;status=redirect;response_cookie=login-token"
                     + ";query_params=code;priority=2",
             "name=pattern_3_basic_form;subtype=post_basic_credentials_status_200"
                     + ";url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token"
-                    + ";form_params=j_username,j_password;priority=3"
+                    + ";priority=3"
     };
 
     @ObjectClassDefinition(
@@ -135,13 +145,13 @@ public final class AuthenticationTrackingFilter implements Filter {
         String[] patterns() default {
                 "name=pattern_1_saml_login;subtype=post_saml_response_redirect_status_302"
                         + ";url_suffix=/saml_login;method=POST;status=redirect;response_cookie=login-token"
-                        + ";body_contains=SAMLResponse=;priority=1",
+                        + ";priority=1",
                 "name=pattern_2_oidc_fragment;subtype=get_oauth_exchange_redirect_status_302"
                         + ";url_suffix=/j_security_check;method=GET;status=redirect;response_cookie=login-token"
                         + ";query_params=code;priority=2",
                 "name=pattern_3_basic_form;subtype=post_basic_credentials_status_200"
                         + ";url_suffix=/j_security_check;method=POST;status=200;response_cookie=login-token"
-                        + ";form_params=j_username,j_password;priority=3"
+                        + ";priority=3"
         };
 
         @AttributeDefinition(
@@ -701,10 +711,42 @@ public final class AuthenticationTrackingFilter implements Filter {
         }
     }
 
+    /**
+     * URL suffixes owned by AEM authentication handlers whose POST body must be parsed natively
+     * by the servlet container (SAML ACS, Sling form login). This filter must never consume their
+     * request body.
+     */
+    private static final Set<String> AUTH_HANDLER_ENDPOINT_SUFFIXES =
+            Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                    "/saml_login",
+                    "/j_security_check")));
+
+    private static boolean isAuthHandlerEndpoint(String uri) {
+        if (uri == null) {
+            return false;
+        }
+        for (String suffix : AUTH_HANDLER_ENDPOINT_SUFFIXES) {
+            if (endsWithInsensitive(uri, suffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private HttpServletRequest bufferIfNeeded(HttpServletRequest request) throws IOException {
         if (!"POST".equalsIgnoreCase(request.getMethod())) {
             return request;
         }
+
+        // Safety guard: NEVER read/buffer the request body of an endpoint owned by an AEM
+        // authentication handler. Consuming and re-parsing the body here (before Sling auth runs)
+        // shadows the servlet container's native parsing of SAMLResponse / j_username / j_password
+        // and can break SAML and form login. These flows are matched from response-side signals
+        // only (status + login-token cookie), so we never need their body.
+        if (isAuthHandlerEndpoint(request.getRequestURI())) {
+            return request;
+        }
+
         Set<String> lanes = bufferLanes;
         if (lanes.isEmpty()) {
             return request;
