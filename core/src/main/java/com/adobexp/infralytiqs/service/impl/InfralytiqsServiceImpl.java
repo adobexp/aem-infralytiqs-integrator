@@ -509,7 +509,24 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
                 continue;
             }
             UserProfile prof = resolved.getOrDefault(hint, UNKNOWN);
-            String resolvedUserId = prof.userId.isEmpty() ? hint : prof.userId;
+
+            // Data-layer identity: the user_id we send to ClickHouse should be the
+            // authenticated user's email whenever we can determine it, so reporting
+            // panels group/count on a human-readable identity instead of an opaque
+            // authorizable id. Resolution order:
+            //   1. Hint is already an email   -> keep it as-is (no replacement needed).
+            //   2. JCR profile yields an email -> replace the id with that email.
+            //   3. No email anywhere           -> fall back to the JCR authorizable id
+            //                                     (or the raw hint when JCR had no match).
+            String authorizableId = prof.userId.isEmpty() ? hint : prof.userId;
+            String resolvedUserId;
+            if (isEmailFormat(hint)) {
+                resolvedUserId = hint;
+            } else if (isEmailFormat(prof.email)) {
+                resolvedUserId = prof.email;
+            } else {
+                resolvedUserId = authorizableId;
+            }
 
             Map<String, String> extraDims = null;
             Map<String, Double> extraMetrics = null;
@@ -521,6 +538,30 @@ public final class InfralytiqsServiceImpl implements InfralytiqsService {
             out.add(p.withUser(resolvedUserId, prof.email, prof.displayName, extraDims, extraMetrics));
         }
         return out;
+    }
+
+    /**
+     * Loose {@code <local>@<domain>.<tld>} email-shape check. Used to decide whether an
+     * authenticated identity is already an email (nothing to do) or an opaque authorizable id
+     * we should try to upgrade to the user's email. Deliberately permissive — we only need to
+     * distinguish "looks like an email" from "is an AEM/IMS authorizable id".
+     */
+    private static boolean isEmailFormat(String s) {
+        if (s == null) {
+            return false;
+        }
+        String v = s.trim();
+        if (v.isEmpty()) {
+            return false;
+        }
+        int at = v.indexOf('@');
+        if (at <= 0 || at != v.lastIndexOf('@') || at == v.length() - 1) {
+            return false;
+        }
+        int dot = v.indexOf('.', at + 1);
+        // a dot must exist in the domain and not be the last character (needs a TLD), and there
+        // must be no whitespace anywhere in the value.
+        return dot > at + 1 && dot < v.length() - 1 && v.indexOf(' ') < 0 && v.indexOf('\t') < 0;
     }
 
     private Map<String, UserProfile> resolveProfiles(
