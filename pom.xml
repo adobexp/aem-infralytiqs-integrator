@@ -57,6 +57,13 @@
 
         <maven-release-plugin>3.0.1</maven-release-plugin>
         <maven-scm-plugin>2.0.1</maven-scm-plugin>
+
+        <!-- Override the central-publishing-maven-plugin version inherited from
+             central-maven-parent (0.7.0). The Sonatype Central Portal API now returns
+             a "warnings" field in DeploymentApiResponse that 0.7.0 cannot deserialize
+             (Jackson UnrecognizedPropertyException), which fails the publish goal even
+             though the bundle uploads successfully. 0.8.0+ recognises the field. -->
+        <central.publishing.plugin.version>0.8.0</central.publishing.plugin.version>
     </properties>
 
     <scm>
@@ -142,6 +149,11 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-deploy-plugin</artifactId>
                     <version>2.8.2</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.sonatype.central</groupId>
+                    <artifactId>central-publishing-maven-plugin</artifactId>
+                    <version>${central.publishing.plugin.version}</version>
                 </plugin>
             </plugins>
         </pluginManagement>
