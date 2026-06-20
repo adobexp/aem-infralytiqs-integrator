@@ -174,6 +174,8 @@ public final class DownloadTrackingFilter implements Filter {
 
     private volatile List<DownloadRule> rules = Collections.emptyList();
 
+    private final DownloadEventDeduper downloadEventDeduper = new DownloadEventDeduper();
+
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policy = ReferencePolicy.DYNAMIC)
     private volatile InfralytiqsService ingestPipeline;
 
@@ -290,6 +292,13 @@ public final class DownloadTrackingFilter implements Filter {
             b.dimension(e.getKey(), e.getValue());
         }
 
+        String downloadPath = verdict.extractedDimensions.get("download_path");
+        if (downloadPath != null && downloadEventDeduper.isDuplicate(remoteUser, downloadPath)) {
+            LOG.debug("[{}] suppressed duplicate download analytics ({}) for path {}",
+                    PID, verdict.code, downloadPath);
+            return;
+        }
+
         ingest.enqueue(b.build());
         LOG.debug("[{}] dispatched download analytics ({})", PID, verdict.code);
     }
@@ -328,7 +337,8 @@ public final class DownloadTrackingFilter implements Filter {
             Map<String, String> dims = new LinkedHashMap<>();
 
             if (rule.extractPathFromUrl) {
-                String resourcePath = stripSuffix(request.getRequestURI(), rule.urlSuffix);
+                String resourcePath =
+                        DownloadPathNormalizer.normalize(stripSuffix(request.getRequestURI(), rule.urlSuffix));
                 if (!resourcePath.isEmpty()) {
                     dims.put("download_path", trim(resourcePath, 2048));
                     String fileType = inferFileType(resourcePath);
